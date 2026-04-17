@@ -1,0 +1,10 @@
+data/
+.venv/
+__pycache__/
+*.pyc
+*.so
+target/
+*.egg-info/
+dist/
+build/
+.env

@@ -1,0 +1,10 @@
+websockets>=13.0,<14.0
+aiohttp>=3.10,<4.0
+pydantic>=2.7,<3.0
+pyarrow>=17.0,<20.0
+polars>=1.0,<2.0
+maturin>=1.0,<2.0
+aiosqlite>=0.20,<1.0
+orjson>=3.10,<4.0
+structlog>=24.0,<25.0
+click>=8.0,<9.0
