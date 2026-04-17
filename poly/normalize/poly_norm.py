@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import zlib
 import structlog
 import orjson
 import polars as pl
@@ -61,7 +62,7 @@ class PolyNormalizer:
                             continue
                         self._process_msg(msg, recv_ns, books, l2_rows, trade_rows, bba_rows)
                         count += 1
-        except EOFError:
+        except (EOFError, zlib.error):
             logger.warning("poly_norm_truncated_gzip")
 
         if l2_rows:

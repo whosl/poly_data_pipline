@@ -117,6 +117,45 @@ python -m poly.main labels 20260417
 - `markout_*s_bps` — markout（基点）
 - `imbalance_bucket / spread_bucket / price_bucket` — 分位桶
 
+### 训练 10 秒 markout baseline
+
+训练管线优先使用 `data/normalized` 和 `data/research` 里的 Parquet，不直接从 raw JSONL 训练。第一版目标是验证 10 秒短周期 markout 是否有稳定可交易信号，而不是预测最终市场结算。
+
+```bash
+# 1) 构造 100ms 采样的特征 + 对齐标签数据集
+python scripts/build_features.py \
+  --data-dir data \
+  --dates 20260417 \
+  --output-dir artifacts/training \
+  --sample-interval-ms 100 \
+  --classification-theta-bps 5 \
+  --entry-threshold-bps 8
+
+# 2) 可选：单独导出 labels 便于检查分布
+python scripts/build_labels.py \
+  --dataset artifacts/training/alpha_dataset.parquet \
+  --output-dir artifacts/training
+
+# 3) 训练第一层 alpha baseline（默认按时间顺序 70/15/15 切分）
+python scripts/train_alpha_model.py \
+  --dataset artifacts/training/alpha_dataset.parquet \
+  --output-dir artifacts/training/models
+
+# 4) 评估预测质量和交易可用性
+python scripts/evaluate_alpha_model.py \
+  --dataset artifacts/training/alpha_dataset.parquet \
+  --model-dir artifacts/training/models \
+  --output-dir artifacts/training/evaluation \
+  --taker-cost-bps 0
+```
+
+产物：
+- `alpha_dataset.parquet/csv` — 特征、10s markout 回归目标、三分类目标、entry-worthiness label
+- `alpha_dataset_metadata.json` — 输入 schema、坏文件报告、特征列、标签列、日期范围、采样配置
+- `models/*.joblib` — ridge/linear/logistic baseline；LightGBM/XGBoost 若环境已安装则自动启用
+- `evaluation/summary_metrics.json` — MAE/RMSE/rank correlation、precision/recall/F1、阈值 entry EV
+- `evaluation/*_by_*_bucket.csv` 和 `*.png` — 按 spread/imbalance/expiry/price 等 regime 的表现
+
 ### 回放
 
 ```bash
