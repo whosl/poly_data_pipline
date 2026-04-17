@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import gzip
 import structlog
 import orjson
 import polars as pl
 from pathlib import Path
 from typing import Callable
+from poly.storage.recover import iter_recovered_gzip_jsonl_lines
 
 logger = structlog.get_logger()
 
@@ -18,30 +18,22 @@ class DataReader:
 
     def read_raw(self, data_dir: Path, source: str, date: str):
         """Stream raw messages from JSONL, ordered by recv_ns."""
-        import zlib
         pattern = f"{source}_*.jsonl.gz"
         raw_dir = data_dir / "raw_feed" / date
         for path in sorted(raw_dir.glob(pattern)):
-            try:
-                with gzip.open(path, "rb") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            outer = orjson.loads(line)
-                        except Exception:
-                            continue
-                        recv_ns = outer.get("recv_ns", 0)
-                        raw = outer.get("raw", {})
-                        if isinstance(raw, str):
-                            try:
-                                raw = orjson.loads(raw)
-                            except Exception:
-                                continue
-                        yield recv_ns, raw
-            except (EOFError, zlib.error) as e:
-                logger.warning("replay_truncated_gzip", path=str(path), error=str(e))
+            for line in iter_recovered_gzip_jsonl_lines(path):
+                try:
+                    outer = orjson.loads(line)
+                except Exception:
+                    continue
+                recv_ns = outer.get("recv_ns", 0)
+                raw = outer.get("raw", {})
+                if isinstance(raw, str):
+                    try:
+                        raw = orjson.loads(raw)
+                    except Exception:
+                        continue
+                yield recv_ns, raw
 
     def read_normalized(self, data_dir: Path, data_type: str, date: str) -> pl.DataFrame:
         """Read normalized Parquet file."""

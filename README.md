@@ -105,6 +105,8 @@ python -m poly.main normalize 20260417 --source binance
 python -m poly.main normalize 20260417 --source polymarket
 ```
 
+Normalizer 和 replay 会扫描 gzip member；如果采集中途被 kill 导致某个 gzip member 损坏，会跳过坏段并继续恢复后续可读 JSONL。
+
 ### 生成研究标签
 
 ```bash

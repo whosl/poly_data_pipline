@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import gzip
-import zlib
 import structlog
 import orjson
 import polars as pl
 from pathlib import Path
+from poly.storage.recover import iter_recovered_gzip_jsonl_lines
 
 logger = structlog.get_logger()
 
@@ -29,79 +28,72 @@ class BinanceNormalizer:
         book_rows: list[dict] = []
         count = 0
 
-        try:
-            with gzip.open(raw_path, "rb") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        outer = orjson.loads(line)
-                    except Exception:
-                        continue
+        for line in iter_recovered_gzip_jsonl_lines(raw_path):
+            try:
+                outer = orjson.loads(line)
+            except Exception:
+                continue
 
-                    recv_ns = outer.get("recv_ns", 0)
-                    raw = outer.get("raw", {})
-                    if isinstance(raw, str):
-                        try:
-                            raw = orjson.loads(raw)
-                        except Exception:
-                            continue
+            recv_ns = outer.get("recv_ns", 0)
+            raw = outer.get("raw", {})
+            if isinstance(raw, str):
+                try:
+                    raw = orjson.loads(raw)
+                except Exception:
+                    continue
 
-                    stream = raw.get("stream", "")
-                    data = raw.get("data")
-                    if data is None:
-                        continue
+            stream = raw.get("stream", "")
+            data = raw.get("data")
+            if data is None:
+                continue
 
-                    if stream.endswith("@bookTicker"):
-                        bba_rows.append({
-                            "source": "binance",
-                            "asset_id": data.get("s", "").lower(),
-                            "recv_ns": recv_ns,
-                            "exchange_ts": data.get("u", 0),
-                            "best_bid": float(data.get("b", "0")),
-                            "best_ask": float(data.get("a", "0")),
-                            "spread": float(data.get("a", "0")) - float(data.get("b", "0")),
-                        })
+            if stream.endswith("@bookTicker"):
+                bba_rows.append({
+                    "source": "binance",
+                    "asset_id": data.get("s", "").lower(),
+                    "recv_ns": recv_ns,
+                    "exchange_ts": data.get("u", 0),
+                    "best_bid": float(data.get("b", "0")),
+                    "best_ask": float(data.get("a", "0")),
+                    "spread": float(data.get("a", "0")) - float(data.get("b", "0")),
+                })
 
-                    elif stream.endswith("@aggTrade"):
-                        side = "SELL" if data.get("m", False) else "BUY"
-                        trade_rows.append({
-                            "source": "binance",
-                            "asset_id": data.get("s", "").lower(),
-                            "market": "",
-                            "recv_ns": recv_ns,
-                            "exchange_ts": data.get("T", 0) * 1_000_000,
-                            "price": float(data.get("p", "0")),
-                            "size": float(data.get("q", "0")),
-                            "side": side,
-                            "fee_rate_bps": 0.0,
-                        })
+            elif stream.endswith("@aggTrade"):
+                side = "SELL" if data.get("m", False) else "BUY"
+                trade_rows.append({
+                    "source": "binance",
+                    "asset_id": data.get("s", "").lower(),
+                    "market": "",
+                    "recv_ns": recv_ns,
+                    "exchange_ts": data.get("T", 0) * 1_000_000,
+                    "price": float(data.get("p", "0")),
+                    "size": float(data.get("q", "0")),
+                    "side": side,
+                    "fee_rate_bps": 0.0,
+                })
 
-                    elif "@depth" in stream:
-                        bids = data.get("bids", [])
-                        asks = data.get("asks", [])
-                        if bids and asks:
-                            symbol = stream.split("@")[0]
-                            book_rows.append({
-                                "source": "binance",
-                                "asset_id": symbol,
-                                "market": "",
-                                "recv_ns": recv_ns,
-                                "exchange_ts": data.get("lastUpdateId", 0),
-                                "best_bid": float(bids[0][0]),
-                                "best_ask": float(asks[0][0]),
-                                "spread": float(asks[0][0]) - float(bids[0][0]),
-                                "midpoint": (float(bids[0][0]) + float(asks[0][0])) / 2,
-                                "microprice": None,
-                                "imbalance": None,
-                                "total_bid_levels": len(bids),
-                                "total_ask_levels": len(asks),
-                            })
+            elif "@depth" in stream:
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                if bids and asks:
+                    symbol = stream.split("@")[0]
+                    book_rows.append({
+                        "source": "binance",
+                        "asset_id": symbol,
+                        "market": "",
+                        "recv_ns": recv_ns,
+                        "exchange_ts": data.get("lastUpdateId", 0),
+                        "best_bid": float(bids[0][0]),
+                        "best_ask": float(asks[0][0]),
+                        "spread": float(asks[0][0]) - float(bids[0][0]),
+                        "midpoint": (float(bids[0][0]) + float(asks[0][0])) / 2,
+                        "microprice": None,
+                        "imbalance": None,
+                        "total_bid_levels": len(bids),
+                        "total_ask_levels": len(asks),
+                    })
 
-                    count += 1
-        except (EOFError, zlib.error):
-            logger.warning("binance_norm_truncated_gzip")
+            count += 1
 
         if bba_rows:
             pl.DataFrame(bba_rows).write_parquet(str(out_dir / "binance_best_bid_ask.parquet"))

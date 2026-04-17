@@ -16,6 +16,22 @@ DEFAULT_HORIZONS_NS = [
 ]
 
 
+def rank_bucket_expr(col: str, prefix: str, n_buckets: int) -> pl.Expr:
+    """Bucket a numeric column without qcut, which can panic on edge cases."""
+    bucket_idx = (
+        (((pl.col(col).rank("average") - 1) * n_buckets) / pl.col(col).count())
+        .floor()
+        .clip(0, n_buckets - 1)
+        .cast(pl.Int32)
+        .cast(pl.String)
+    )
+    return (
+        pl.when(pl.col(col).is_null())
+        .then(pl.lit(f"{prefix}0"))
+        .otherwise(pl.concat_str([pl.lit(prefix), bucket_idx]))
+    )
+
+
 class LabelGenerator:
     """Generate markout and feature bucket labels for research."""
 
@@ -72,7 +88,6 @@ class LabelGenerator:
     ) -> pl.DataFrame:
         """Add imbalance/spread/price decile buckets."""
         result = l2_book.clone()
-        labels = [f"q{i}" for i in range(n_buckets)]
 
         def safe_qcut(df: pl.DataFrame, col: str, alias: str) -> pl.DataFrame:
             if col not in df.columns:
@@ -80,9 +95,7 @@ class LabelGenerator:
             n_unique = df[col].n_unique()
             if n_unique <= 1:
                 return df.with_columns(pl.lit("q0").alias(alias))
-            return df.with_columns(
-                pl.col(col).qcut(n_buckets, labels=labels, allow_duplicates=True).alias(alias)
-            )
+            return df.with_columns(rank_bucket_expr(col, "q", n_buckets).alias(alias))
 
         result = safe_qcut(result, "imbalance", "imbalance_bucket")
         result = safe_qcut(result, "spread", "spread_bucket")
@@ -104,10 +117,11 @@ class LabelGenerator:
             pl.col("midpoint").pct_change().rolling_std(
                 window_size=100,  # approximate 60s in ticks
             ).alias("vol_60s")
-        ).with_columns(
-            pl.col("vol_60s").qcut(10, labels=[f"v{i}" for i in range(10)], allow_duplicates=True).alias("vol_bucket")
         )
-        return result
+        vol = result["vol_60s"].drop_nulls()
+        if vol.is_empty() or vol.n_unique() <= 1:
+            return result.with_columns(pl.lit("v0").alias("vol_bucket"))
+        return result.with_columns(rank_bucket_expr("vol_60s", "v", 10).alias("vol_bucket"))
 
     def run(self, data_dir: Path, date: str) -> None:
         """Generate all labels for a given date."""

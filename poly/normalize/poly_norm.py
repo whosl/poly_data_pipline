@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import gzip
-import zlib
 import structlog
 import orjson
 import polars as pl
 from pathlib import Path
+from poly.storage.recover import iter_recovered_gzip_jsonl_lines
 
 logger = structlog.get_logger()
 
@@ -32,38 +31,31 @@ class PolyNormalizer:
         books: dict[str, poly_core.OrderBook] = {}
 
         count = 0
-        try:
-            with gzip.open(raw_path, "rb") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        outer = orjson.loads(line)
-                    except Exception:
-                        continue
+        for line in iter_recovered_gzip_jsonl_lines(raw_path):
+            try:
+                outer = orjson.loads(line)
+            except Exception:
+                continue
 
-                    recv_ns = outer.get("recv_ns", 0)
-                    raw_payload = outer.get("raw", {})
-                    if isinstance(raw_payload, str):
-                        try:
-                            raw_payload = orjson.loads(raw_payload)
-                        except Exception:
-                            continue
+            recv_ns = outer.get("recv_ns", 0)
+            raw_payload = outer.get("raw", {})
+            if isinstance(raw_payload, str):
+                try:
+                    raw_payload = orjson.loads(raw_payload)
+                except Exception:
+                    continue
 
-                    # Raw may be a single dict or list of events
-                    if isinstance(raw_payload, list):
-                        msgs = raw_payload
-                    else:
-                        msgs = [raw_payload]
+            # Raw may be a single dict or list of events
+            if isinstance(raw_payload, list):
+                msgs = raw_payload
+            else:
+                msgs = [raw_payload]
 
-                    for msg in msgs:
-                        if not isinstance(msg, dict):
-                            continue
-                        self._process_msg(msg, recv_ns, books, l2_rows, trade_rows, bba_rows)
-                        count += 1
-        except (EOFError, zlib.error):
-            logger.warning("poly_norm_truncated_gzip")
+            for msg in msgs:
+                if not isinstance(msg, dict):
+                    continue
+                self._process_msg(msg, recv_ns, books, l2_rows, trade_rows, bba_rows)
+                count += 1
 
         if l2_rows:
             pl.DataFrame(l2_rows).write_parquet(str(out_dir / "poly_l2_book.parquet"))
