@@ -662,6 +662,7 @@ def infer_feature_columns(df: pl.DataFrame) -> list[str]:
         "symbol",
         "market",
         "source",
+        "realized_edge_after_entry_cost_bps",
     }
     numeric = {pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64}
     return [
