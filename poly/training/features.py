@@ -473,6 +473,7 @@ def add_binance_features(
     if binance_book.is_empty():
         df = df.with_columns(empty_binance_feature_exprs())
     else:
+        join_globally = binance_book["binance_symbol"].drop_nulls().n_unique() <= 1
         b = binance_book.sort("recv_ns").with_columns(
             [
                 pl.col("binance_mid").pct_change().alias("binance_return_tick"),
@@ -482,18 +483,27 @@ def add_binance_features(
                 pl.col("binance_mid").pct_change(n=30).alias("binance_return_3s"),
             ]
         )
-        df = join_asof_by_group(
-            df,
-            b.rename({"binance_symbol": "symbol"}),
-            by=["symbol"],
-            tolerance_ms=tolerance_ms,
-        )
+        if join_globally:
+            df = df.sort("recv_ns").join_asof(
+                b.drop(["binance_symbol"], strict=False),
+                on="recv_ns",
+                strategy="backward",
+                tolerance=tolerance_ms * NS_PER_MS,
+            )
+        else:
+            df = join_asof_by_group(
+                df,
+                b.rename({"binance_symbol": "symbol"}),
+                by=["symbol"],
+                tolerance_ms=tolerance_ms,
+            )
         for expr in empty_binance_feature_exprs():
             name = expr.meta.output_name()
             if name not in df.columns:
                 df = df.with_columns(expr)
 
     if not binance_trades.is_empty():
+        join_globally = binance_trades["symbol"].drop_nulls().n_unique() <= 1
         bt = binance_trades.sort("recv_ns").with_columns(
             [
                 (pl.col("size") * pl.col("signed_side")).rolling_sum(window_size=20).alias("binance_recent_trade_signed_volume"),
@@ -503,12 +513,20 @@ def add_binance_features(
             (pl.col("binance_recent_trade_signed_volume") / (pl.col("binance_recent_trade_volume") + 1e-12))
             .alias("binance_recent_trade_imbalance")
         ).select(["recv_ns", "symbol", "binance_recent_trade_imbalance"])
-        df = join_asof_by_group(
-            df,
-            bt,
-            by=["symbol"],
-            tolerance_ms=tolerance_ms,
-        )
+        if join_globally:
+            df = df.sort("recv_ns").join_asof(
+                bt.drop(["symbol"], strict=False),
+                on="recv_ns",
+                strategy="backward",
+                tolerance=tolerance_ms * NS_PER_MS,
+            )
+        else:
+            df = join_asof_by_group(
+                df,
+                bt,
+                by=["symbol"],
+                tolerance_ms=tolerance_ms,
+            )
     elif "binance_recent_trade_imbalance" not in df.columns:
         df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("binance_recent_trade_imbalance"))
 
