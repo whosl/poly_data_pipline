@@ -123,6 +123,22 @@ python -m poly.main labels 20260417
 
 训练管线优先使用 `data/normalized` 和 `data/research` 里的 Parquet，不直接从 raw JSONL 训练。第一版目标是验证 10 秒短周期 markout 是否有稳定可交易信号，而不是预测最终市场结算。
 
+给后续 coding agent 的详细接手说明见 [`docs/training_agent_guide.md`](docs/training_agent_guide.md)。
+
+当前无泄漏版 feature list（单 Binance symbol 时，Binance reference 按时间戳 asof join）：
+
+| 分组 | 特征 |
+|------|------|
+| Polymarket top-of-book / price | `best_bid`, `best_ask`, `current_mid`, `current_spread`, `relative_spread`, `current_microprice` |
+| Polymarket imbalance / depth proxy | `top1_imbalance`, `total_bid_levels`, `total_ask_levels`, `top3_imbalance`, `top5_imbalance`, `top10_imbalance`, `cum_bid_depth_topN_proxy`, `cum_ask_depth_topN_proxy`, `depth_level_imbalance_proxy` |
+| Polymarket book event activity | `book_update_count_100ms`, `book_update_count_500ms`, `book_update_count_1s`, `spread_widen_count_recent`, `spread_narrow_count_recent`, `realized_vol_short` |
+| Polymarket short return | `poly_return_1s` |
+| Binance reference | `binance_mid`, `binance_spread`, `binance_return_tick`, `binance_return_100ms`, `binance_return_500ms`, `binance_return_1s`, `binance_return_3s`, `binance_recent_trade_imbalance` |
+| Lead-lag | `lead_lag_binance_minus_poly_1s`, `lead_lag_binance_minus_poly_500ms` |
+| Regime / research volatility | `vol_60s` |
+
+注意：`top3_imbalance/top5_imbalance/top10_imbalance` 和 `cum_*_depth_topN_proxy` 目前是 proxy，因为 normalized L2 还没有保存真实 top-N 价量档位。`realized_edge_after_entry_cost_bps` 是由未来 markout 派生的标签类字段，禁止作为训练特征。
+
 ```bash
 # 1) 构造 100ms 采样的特征 + 对齐标签数据集
 python scripts/build_features.py \
