@@ -19,6 +19,7 @@ from poly.config import Config
 from poly.storage.raw import RawWriter
 from poly.storage.normalized import ParquetWriter, L2_BOOK_SCHEMA, TRADE_SCHEMA, BEST_BID_ASK_SCHEMA
 from poly.engine.orderbook import OrderBookEngine
+from poly.metadata.polymarket import market_to_asset_rows
 
 logger = structlog.get_logger()
 
@@ -48,7 +49,7 @@ def _upcoming_timestamps(period: int, ahead: int, now: int) -> list[int]:
 
 
 async def fetch_market_tokens(session: aiohttp.ClientSession, slug: str) -> dict | None:
-    """Fetch market info from Gamma API by slug. Returns {slug, token_ids, condition_id} or None."""
+    """Fetch market info from Gamma API by slug."""
     try:
         async with session.get(
             "https://gamma-api.polymarket.com/markets",
@@ -68,12 +69,14 @@ async def fetch_market_tokens(session: aiohttp.ClientSession, slug: str) -> dict
                 token_ids = json.loads(tokens_str) if isinstance(tokens_str, str) else tokens_str
             except json.JSONDecodeError:
                 return None
+            metadata_rows = market_to_asset_rows(m)
             return {
                 "slug": slug,
                 "question": m.get("question", ""),
                 "token_ids": token_ids,
                 "condition_id": m.get("conditionId", ""),
                 "active": m.get("active", False),
+                "metadata_rows": metadata_rows,
             }
     except Exception as e:
         logger.warning("fetch_market_error", slug=slug, error=str(e))
@@ -94,6 +97,7 @@ class UpDownCollector:
         self.engine = engine
         self._ws = None
         self._subscribed_assets: dict[str, str] = {}  # asset_id -> slug
+        self._asset_metadata: dict[str, dict[str, object]] = {}
         self._known_slugs: set[str] = set()
         self._msg_count = 0
 
@@ -188,6 +192,10 @@ class UpDownCollector:
                 continue
 
             self._known_slugs.add(slug)
+            for row in info.get("metadata_rows", []):
+                asset_id = str(row.get("asset_id") or "")
+                if asset_id:
+                    self._asset_metadata[asset_id] = row
             for tid in info["token_ids"]:
                 self._subscribed_assets[tid] = slug
                 new_assets.append(tid)
@@ -232,7 +240,7 @@ class UpDownCollector:
         features = self.engine.handle_book(asset_id, bids, asks, exchange_ts)
         if features:
             slug = self._subscribed_assets.get(asset_id, "")
-            row = self._book_row(features, recv_ns, exchange_ts, market, slug)
+            row = self._book_row(features, recv_ns, exchange_ts, market, slug, self._asset_metadata.get(asset_id))
             self.book_writer.append(row)
 
     def _handle_price_change(self, msg: dict, recv_ns: int) -> None:
@@ -246,14 +254,14 @@ class UpDownCollector:
             features = self.engine.handle_price_change(asset_id, side, price, size, exchange_ts)
             if features:
                 slug = self._subscribed_assets.get(asset_id, "")
-                row = self._book_row(features, recv_ns, exchange_ts, market, slug)
+                row = self._book_row(features, recv_ns, exchange_ts, market, slug, self._asset_metadata.get(asset_id))
                 self.book_writer.append(row)
 
     def _handle_trade(self, msg: dict, recv_ns: int) -> None:
         asset_id = msg.get("asset_id", "")
         slug = self._subscribed_assets.get(asset_id, "")
-        self.trade_writer.append({
-            "source": "polymarket",
+        row = {
+            "source": f"polymarket:{slug}" if slug else "polymarket",
             "asset_id": asset_id,
             "market": msg.get("market", ""),
             "recv_ns": recv_ns,
@@ -262,18 +270,25 @@ class UpDownCollector:
             "size": float(msg.get("size", "0")),
             "side": msg.get("side", ""),
             "fee_rate_bps": float(msg.get("fee_rate_bps", "0")),
-        })
+        }
+        row.update(self._metadata_fields(self._asset_metadata.get(asset_id), slug))
+        self.trade_writer.append(row)
 
     def _handle_bba(self, msg: dict, recv_ns: int) -> None:
-        self.bba_writer.append({
-            "source": "polymarket",
-            "asset_id": msg.get("asset_id", ""),
+        asset_id = msg.get("asset_id", "")
+        slug = self._subscribed_assets.get(asset_id, "")
+        row = {
+            "source": f"polymarket:{slug}" if slug else "polymarket",
+            "asset_id": asset_id,
+            "market": msg.get("market", ""),
             "recv_ns": recv_ns,
             "exchange_ts": int(msg.get("timestamp", "0")),
             "best_bid": float(msg.get("best_bid", "0")),
             "best_ask": float(msg.get("best_ask", "0")),
             "spread": float(msg.get("spread", "0")),
-        })
+        }
+        row.update(self._metadata_fields(self._asset_metadata.get(asset_id), slug))
+        self.bba_writer.append(row)
 
     async def _heartbeat(self, ws) -> None:
         while True:
@@ -285,8 +300,8 @@ class UpDownCollector:
 
     @staticmethod
     def _book_row(features: dict, recv_ns: int, exchange_ts: int,
-                  market: str = "", slug: str = "") -> dict:
-        return {
+                  market: str = "", slug: str = "", metadata: dict[str, object] | None = None) -> dict:
+        row = {
             "source": f"polymarket:{slug}" if slug else "polymarket",
             "asset_id": str(features.get("asset_id", "")),
             "market": market,
@@ -300,4 +315,23 @@ class UpDownCollector:
             "imbalance": float(features.get("imbalance") or 0),
             "total_bid_levels": int(features.get("total_bid_levels") or 0),
             "total_ask_levels": int(features.get("total_ask_levels") or 0),
+        }
+        row.update(UpDownCollector._metadata_fields(metadata, slug))
+        return row
+
+    @staticmethod
+    def _metadata_fields(metadata: dict[str, object] | None, slug: str = "") -> dict[str, object]:
+        metadata = metadata or {}
+        return {
+            "market_id": metadata.get("market_id"),
+            "condition_id": metadata.get("condition_id"),
+            "slug": metadata.get("slug") or slug,
+            "outcome": metadata.get("outcome"),
+            "symbol": metadata.get("symbol"),
+            "period": metadata.get("period"),
+            "expiry_ns": metadata.get("expiry_ns"),
+            "tick_size": metadata.get("tick_size"),
+            "min_order_size": metadata.get("min_order_size"),
+            "maker_base_fee": metadata.get("maker_base_fee"),
+            "taker_base_fee": metadata.get("taker_base_fee"),
         }

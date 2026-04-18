@@ -125,6 +125,32 @@ async def _run_normalize(date: str, source: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# metadata command
+# ---------------------------------------------------------------------------
+
+async def _run_metadata(dates: tuple[str, ...]) -> None:
+    from poly.config import get_config
+    from poly.metadata.polymarket import MetadataFetchConfig, fetch_metadata, write_metadata_by_date
+    from poly.training.io import discover_dates
+
+    config = get_config()
+    target_dates = discover_dates(config.data_dir, dates or None)
+    if not target_dates:
+        raise click.ClickException("No dates found under normalized/research. Pass at least one YYYYMMDD date.")
+    fetch_config = MetadataFetchConfig(
+        data_dir=config.data_dir,
+        gamma_url=config.gamma_url,
+        clob_url=config.clob_url,
+        dates=tuple(target_dates),
+    )
+    frame = await fetch_metadata(fetch_config)
+    paths = write_metadata_by_date(frame, config.data_dir, target_dates)
+    click.echo(f"rows={frame.height}")
+    for path in paths:
+        click.echo(f"metadata={path}")
+
+
+# ---------------------------------------------------------------------------
 # labels command
 # ---------------------------------------------------------------------------
 
@@ -196,6 +222,13 @@ def collect(tags, symbols):
 def normalize(date, source):
     """Run normalization pipeline for a specific date."""
     asyncio.run(_run_normalize(date, source))
+
+
+@cli.command()
+@click.argument("dates", nargs=-1)
+def metadata(dates):
+    """Fetch Polymarket Up/Down market metadata parquet."""
+    asyncio.run(_run_metadata(tuple(dates)))
 
 
 @cli.command()

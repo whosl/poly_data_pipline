@@ -6,6 +6,7 @@ import structlog
 import orjson
 import polars as pl
 from pathlib import Path
+from poly.metadata.polymarket import enrich_with_metadata, load_metadata
 from poly.storage.recover import iter_recovered_gzip_jsonl_lines
 
 logger = structlog.get_logger()
@@ -58,15 +59,15 @@ class PolyNormalizer:
                 count += 1
 
         if l2_rows:
-            pl.DataFrame(l2_rows).write_parquet(str(out_dir / "poly_l2_book.parquet"))
+            self._enrich(pl.DataFrame(l2_rows), data_dir, date).write_parquet(str(out_dir / "poly_l2_book.parquet"))
             logger.info("poly_norm_l2", rows=len(l2_rows))
 
         if trade_rows:
-            pl.DataFrame(trade_rows).write_parquet(str(out_dir / "poly_trades.parquet"))
+            self._enrich(pl.DataFrame(trade_rows), data_dir, date).write_parquet(str(out_dir / "poly_trades.parquet"))
             logger.info("poly_norm_trades", rows=len(trade_rows))
 
         if bba_rows:
-            pl.DataFrame(bba_rows).write_parquet(str(out_dir / "poly_best_bid_ask.parquet"))
+            self._enrich(pl.DataFrame(bba_rows), data_dir, date).write_parquet(str(out_dir / "poly_best_bid_ask.parquet"))
             logger.info("poly_norm_bba", rows=len(bba_rows))
 
         logger.info("poly_norm_done", date=date, total_messages=count)
@@ -88,7 +89,7 @@ class PolyNormalizer:
             books[asset_id].apply_snapshot(bids, asks, exchange_ts)
             features = books[asset_id].depth_summary()
             if features:
-                l2_rows.append(self._book_features(features, recv_ns, exchange_ts))
+                l2_rows.append(self._book_features(features, recv_ns, exchange_ts, msg.get("market", "")))
 
         elif event_type == "price_change":
             exchange_ts = int(msg.get("timestamp", "0"))
@@ -104,7 +105,7 @@ class PolyNormalizer:
                 )
                 features = books[asset_id].depth_summary()
                 if features:
-                    l2_rows.append(self._book_features(features, recv_ns, exchange_ts))
+                    l2_rows.append(self._book_features(features, recv_ns, exchange_ts, msg.get("market", "")))
 
         elif event_type == "last_trade_price":
             trade_rows.append({
@@ -123,6 +124,7 @@ class PolyNormalizer:
             bba_rows.append({
                 "source": "polymarket",
                 "asset_id": msg.get("asset_id", ""),
+                "market": msg.get("market", ""),
                 "recv_ns": recv_ns,
                 "exchange_ts": int(msg.get("timestamp", "0")),
                 "best_bid": float(msg.get("best_bid", "0")),
@@ -131,11 +133,11 @@ class PolyNormalizer:
             })
 
     @staticmethod
-    def _book_features(features: dict, recv_ns: int, exchange_ts: int) -> dict:
+    def _book_features(features: dict, recv_ns: int, exchange_ts: int, market: str = "") -> dict:
         return {
             "source": "polymarket",
             "asset_id": str(features.get("asset_id", "")),
-            "market": "",
+            "market": market,
             "recv_ns": recv_ns,
             "exchange_ts": exchange_ts,
             "best_bid": float(features.get("best_bid") or 0),
@@ -147,3 +149,18 @@ class PolyNormalizer:
             "total_bid_levels": int(features.get("total_bid_levels") or 0),
             "total_ask_levels": int(features.get("total_ask_levels") or 0),
         }
+
+    @staticmethod
+    def _enrich(frame: pl.DataFrame, data_dir: Path, date: str) -> pl.DataFrame:
+        metadata = load_metadata(data_dir, date)
+        if metadata.is_empty():
+            return frame
+        enriched = enrich_with_metadata(frame, metadata)
+        if "source" in enriched.columns and "slug" in enriched.columns:
+            enriched = enriched.with_columns(
+                pl.when((pl.col("source") == "polymarket") & pl.col("slug").is_not_null() & (pl.col("slug") != ""))
+                .then(pl.concat_str([pl.lit("polymarket:"), pl.col("slug")]))
+                .otherwise(pl.col("source"))
+                .alias("source")
+            )
+        return enriched

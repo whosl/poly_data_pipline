@@ -9,6 +9,7 @@ from pathlib import Path
 import polars as pl
 import structlog
 
+from poly.metadata.polymarket import enrich_with_metadata
 from poly.training.config import DatasetConfig, dataclass_to_json_dict, save_json
 from poly.training.io import TableLoadResult, concat_non_empty, load_date_tables, schema_report
 from poly.training.labels import add_alpha_labels, add_entry_net_edge, maker_fill_label_design
@@ -55,7 +56,8 @@ def build_date_dataset(
     tables: dict[str, TableLoadResult],
     config: DatasetConfig,
 ) -> pl.DataFrame:
-    poly_book = choose_poly_book(tables)
+    metadata = canonicalize_metadata(get_frame(tables, "poly_market_metadata"))
+    poly_book = enrich_with_metadata(choose_poly_book(tables), metadata)
     if poly_book is None or poly_book.is_empty():
         logger.warning("missing_poly_book", date=date)
         return pl.DataFrame()
@@ -68,7 +70,8 @@ def build_date_dataset(
     samples = sample_book(book, config.sample_interval_ms)
     samples = add_lob_features(samples)
     samples = add_book_event_features(samples, book)
-    samples = add_trade_features(samples, canonicalize_trades(get_frame(tables, "poly_trades")))
+    poly_trades = enrich_with_metadata(get_frame(tables, "poly_trades"), metadata)
+    samples = add_trade_features(samples, canonicalize_trades(poly_trades))
     samples = add_binance_features(
         samples,
         canonicalize_binance_book(tables),
@@ -107,6 +110,16 @@ def get_frame(tables: dict[str, TableLoadResult], name: str) -> pl.DataFrame | N
     return result.frame
 
 
+def canonicalize_metadata(metadata: pl.DataFrame | None) -> pl.DataFrame:
+    if metadata is None or metadata.is_empty() or "asset_id" not in metadata.columns:
+        return pl.DataFrame()
+    df = metadata
+    for col in ["asset_id", "market_id", "condition_id", "slug", "outcome", "symbol", "period"]:
+        if col in df.columns:
+            df = df.with_columns(pl.col(col).cast(pl.String))
+    return df
+
+
 def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
     if book is None or book.is_empty() or "recv_ns" not in book.columns:
         return pl.DataFrame()
@@ -118,6 +131,11 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
         df = df.with_columns(pl.lit("").alias("market"))
     if "source" not in df.columns:
         df = df.with_columns(pl.lit("").alias("source"))
+    for col in ["market_id", "condition_id", "slug", "outcome", "symbol", "period"]:
+        if col not in df.columns:
+            df = df.with_columns(pl.lit("").alias(col))
+    if "expiry_ns" not in df.columns:
+        df = df.with_columns(pl.lit(None, dtype=pl.Int64).alias("expiry_ns"))
     if "best_bid" not in df.columns:
         df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("best_bid"))
     if "best_ask" not in df.columns:
@@ -140,6 +158,13 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
             pl.col("asset_id").cast(pl.String),
             pl.col("market").cast(pl.String),
             pl.col("source").cast(pl.String),
+            pl.col("market_id").cast(pl.String),
+            pl.col("condition_id").cast(pl.String),
+            pl.col("slug").cast(pl.String),
+            pl.col("outcome").cast(pl.String),
+            pl.col("symbol").cast(pl.String),
+            pl.col("period").cast(pl.String),
+            pl.col("expiry_ns").cast(pl.Int64),
             pl.col("best_bid").cast(pl.Float64),
             pl.col("best_ask").cast(pl.Float64),
             pl.col("midpoint").cast(pl.Float64).alias("current_mid"),
@@ -154,21 +179,36 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
     )
     df = df.with_columns(
         [
-            pl.col("_market_hint").map_elements(extract_market_id, return_dtype=pl.String).alias("market_id"),
-            pl.col("_market_hint").map_elements(extract_symbol, return_dtype=pl.String).alias("symbol"),
-            pl.col("_market_hint").map_elements(extract_expiry_ns, return_dtype=pl.Int64).alias("expiry_ns"),
+            pl.col("_market_hint").map_elements(extract_market_id, return_dtype=pl.String).alias("_hint_market_id"),
+            pl.col("_market_hint").map_elements(extract_symbol, return_dtype=pl.String).alias("_hint_symbol"),
+            pl.col("_market_hint").map_elements(extract_expiry_ns, return_dtype=pl.Int64).alias("_hint_expiry_ns"),
         ]
     )
     df = df.with_columns(
         [
             pl.when(pl.col("market_id").is_null() | (pl.col("market_id") == ""))
-            .then(pl.concat_str([pl.lit("asset:"), pl.col("asset_id")]))
+            .then(
+                pl.when(pl.col("_hint_market_id").is_not_null() & (pl.col("_hint_market_id") != ""))
+                .then(pl.col("_hint_market_id"))
+                .when(pl.col("condition_id").is_not_null() & (pl.col("condition_id") != ""))
+                .then(pl.col("condition_id"))
+                .otherwise(pl.concat_str([pl.lit("asset:"), pl.col("asset_id")]))
+            )
             .otherwise(pl.col("market_id"))
             .alias("market_id"),
             pl.when(pl.col("symbol").is_null() | (pl.col("symbol") == ""))
-            .then(infer_symbol_from_asset(pl.col("asset_id")))
+            .then(
+                pl.when(pl.col("_hint_symbol").is_not_null() & (pl.col("_hint_symbol") != ""))
+                .then(pl.col("_hint_symbol"))
+                .otherwise(infer_symbol_from_asset(pl.col("asset_id")))
+            )
             .otherwise(pl.col("symbol"))
             .alias("symbol"),
+            pl.coalesce([pl.col("expiry_ns"), pl.col("_hint_expiry_ns")]).alias("expiry_ns"),
+        ]
+    )
+    df = df.with_columns(
+        [
             ((pl.col("expiry_ns") - pl.col("recv_ns")) / NS_PER_SECOND).alias("time_to_expiry_seconds"),
         ]
     )
@@ -190,6 +230,11 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
         "symbol",
         "market",
         "source",
+        "condition_id",
+        "slug",
+        "outcome",
+        "period",
+        "expiry_ns",
         "time_to_expiry_seconds",
         "expiry_bucket",
         "market_phase",
@@ -207,6 +252,12 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
         "price_bucket",
         "vol_bucket",
         "vol_60s",
+        "tick_size",
+        "min_order_size",
+        "maker_base_fee",
+        "taker_base_fee",
+        "volume_24h",
+        "liquidity",
     ]
     keep_cols = [c for c in keep_cols if c in df.columns]
     return (
@@ -308,6 +359,9 @@ def canonicalize_trades(trades: pl.DataFrame | None) -> pl.DataFrame:
     for col in ["asset_id", "market", "source", "side"]:
         if col not in df.columns:
             df = df.with_columns(pl.lit("").alias(col))
+    for col in ["market_id", "condition_id", "slug", "outcome", "symbol", "period"]:
+        if col not in df.columns:
+            df = df.with_columns(pl.lit("").alias(col))
     for col in ["price", "size"]:
         if col not in df.columns:
             df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias(col))
@@ -317,6 +371,12 @@ def canonicalize_trades(trades: pl.DataFrame | None) -> pl.DataFrame:
             pl.col("asset_id").cast(pl.String),
             pl.col("market").cast(pl.String),
             pl.col("source").cast(pl.String),
+            pl.col("market_id").cast(pl.String),
+            pl.col("condition_id").cast(pl.String),
+            pl.col("slug").cast(pl.String),
+            pl.col("outcome").cast(pl.String),
+            pl.col("symbol").cast(pl.String),
+            pl.col("period").cast(pl.String),
             pl.col("side").cast(pl.String).str.to_uppercase(),
             pl.col("price").cast(pl.Float64),
             pl.col("size").cast(pl.Float64),
@@ -326,8 +386,8 @@ def canonicalize_trades(trades: pl.DataFrame | None) -> pl.DataFrame:
     )
     return df.with_columns(
         [
-            pl.col("_market_hint").map_elements(extract_market_id, return_dtype=pl.String).alias("market_id"),
-            pl.col("_market_hint").map_elements(extract_symbol, return_dtype=pl.String).alias("symbol"),
+            pl.col("_market_hint").map_elements(extract_market_id, return_dtype=pl.String).alias("_hint_market_id"),
+            pl.col("_market_hint").map_elements(extract_symbol, return_dtype=pl.String).alias("_hint_symbol"),
             pl.when(pl.col("side").is_in(["BUY", "BID"]))
             .then(pl.lit(1.0))
             .when(pl.col("side").is_in(["SELL", "ASK"]))
@@ -337,9 +397,20 @@ def canonicalize_trades(trades: pl.DataFrame | None) -> pl.DataFrame:
         ]
     ).with_columns(
         pl.when(pl.col("market_id").is_null() | (pl.col("market_id") == ""))
-        .then(pl.concat_str([pl.lit("asset:"), pl.col("asset_id")]))
+        .then(
+            pl.when(pl.col("_hint_market_id").is_not_null() & (pl.col("_hint_market_id") != ""))
+            .then(pl.col("_hint_market_id"))
+            .when(pl.col("condition_id").is_not_null() & (pl.col("condition_id") != ""))
+            .then(pl.col("condition_id"))
+            .otherwise(pl.concat_str([pl.lit("asset:"), pl.col("asset_id")]))
+        )
         .otherwise(pl.col("market_id"))
         .alias("market_id")
+    ).with_columns(
+        pl.when(pl.col("symbol").is_null() | (pl.col("symbol") == ""))
+        .then(pl.col("_hint_symbol"))
+        .otherwise(pl.col("symbol"))
+        .alias("symbol")
     )
 
 
@@ -680,16 +751,30 @@ def infer_feature_columns(df: pl.DataFrame) -> list[str]:
         "symbol",
         "market",
         "source",
+        "condition_id",
+        "slug",
+        "outcome",
+        "period",
+        "question",
+        "expiry_ns",
         "realized_edge_after_entry_cost_bps",
     }
     numeric = {pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64}
-    return [
+    feature_cols = [
         col
         for col, dtype in df.schema.items()
         if dtype in numeric
         and col not in excluded
         and not col.startswith(excluded_prefixes)
     ]
+    categorical_features = [
+        "imbalance_bucket",
+        "spread_bucket",
+        "price_bucket",
+        "vol_bucket",
+    ]
+    feature_cols.extend([col for col in categorical_features if col in df.columns and col not in feature_cols])
+    return feature_cols
 
 
 def make_metadata(

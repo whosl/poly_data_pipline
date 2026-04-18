@@ -144,7 +144,7 @@ Splitting:
 
 ## Current Feature List
 
-After fixing leakage and enabling single-symbol Binance timestamp joins, the current feature set has 33 features.
+After fixing leakage, enabling single-symbol Binance timestamp joins, adding categorical regime buckets, and joining Polymarket metadata, the current verified feature set is 42 features on `20260417`. Without metadata artifacts it falls back to the earlier 37-feature set.
 
 Polymarket top-of-book and price:
 
@@ -195,9 +195,36 @@ Binance reference features:
 - `lead_lag_binance_minus_poly_1s`
 - `lead_lag_binance_minus_poly_500ms`
 
-Regime/research volatility:
+Regime/metadata/research buckets and volatility:
 
+- `time_to_expiry_seconds`
+- `tick_size`
+- `min_order_size`
+- `maker_base_fee`
+- `taker_base_fee`
+- `imbalance_bucket`
+- `spread_bucket`
+- `price_bucket`
+- `vol_bucket`
 - `vol_60s`
+
+The four bucket features are categorical and are one-hot encoded by `poly/training/models.py`.
+
+`volume_24h` and `liquidity` are carried through metadata when the source provides them, but they are not guaranteed to be training features. On the CLOB condition-id backfill path they are currently null and are dropped by the `max_null_fraction` filter.
+
+Market metadata is fetched with:
+
+```bash
+python scripts/fetch_polymarket_metadata.py --data-dir data --dates 20260417
+```
+
+or through the CLI:
+
+```bash
+python -m poly.main metadata 20260417
+```
+
+This writes `data/normalized/YYYYMMDD/poly_market_metadata.parquet`. It is one row per `asset_id`, with `market_id`, `condition_id`, `slug`, `outcome`, `symbol`, `period`, `expiry_ns`, tick/min-size/fee fields, and liquidity/volume snapshots. Re-run `python -m poly.main normalize YYYYMMDD --source polymarket` after fetching metadata to enrich normalized book/trade/BBA parquet. The training builder also joins this metadata directly if the normalized book was produced before the metadata artifact existed.
 
 ## Binance Join Logic
 
@@ -382,7 +409,7 @@ Never include these columns as features:
 
 Be careful with:
 
-- bucket columns generated using full-day quantiles. These are okay for quick diagnostics but can leak distributional information across splits. Prefer train-fit bucket boundaries for strict experiments.
+- bucket columns generated using full-day quantiles. These are currently included as categorical features for the baseline, but they can leak distributional information across splits. Prefer train-fit bucket boundaries for strict experiments.
 - rolling features that are not grouped by asset/market.
 - Binance joins that use future timestamps. Use backward as-of joins only for features.
 - future-mid labels that cross market boundaries. Always group by `market_id` and `asset_id`.
@@ -435,4 +462,3 @@ When taking a new task:
 7. Train and evaluate.
 8. Report both ML metrics and trading-usefulness metrics.
 9. Treat any perfect score as suspicious until leakage is disproven.
-

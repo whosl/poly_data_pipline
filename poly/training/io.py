@@ -58,6 +58,7 @@ def load_date_tables(data_dir: Path, date: str) -> dict[str, TableLoadResult]:
         "binance_l2_book": ("normalized", "binance_l2_book"),
         "binance_best_bid_ask": ("normalized", "binance_best_bid_ask"),
         "binance_trades": ("normalized", "binance_trades"),
+        "poly_market_metadata": ("normalized", "poly_market_metadata"),
         "poly_enriched_book": ("research", "poly_enriched_book"),
         "poly_markout_labels": ("research", "poly_markout_labels"),
         "binance_markout_labels": ("research", "binance_markout_labels"),
@@ -102,4 +103,3 @@ def concat_non_empty(frames: list[pl.DataFrame]) -> pl.DataFrame:
     if not frames:
         return pl.DataFrame()
     return pl.concat(frames, how="diagonal_relaxed")
-

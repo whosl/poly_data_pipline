@@ -33,12 +33,14 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
     from sklearn.impute import SimpleImputer
     from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
     from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
     dataset = pl.read_parquet(str(config.dataset_path))
     feature_columns = infer_feature_columns(dataset)
     if not feature_columns:
-        raise ValueError("no numeric feature columns found")
+        raise ValueError("no feature columns found")
+    categorical_columns = [col for col in feature_columns if dataset.schema[col] == pl.String]
+    numeric_columns = [col for col in feature_columns if col not in categorical_columns]
 
     splits = chronological_split(
         dataset,
@@ -50,14 +52,8 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
     if train_df.is_empty():
         raise ValueError("training split is empty after dropping missing targets")
 
-    preprocessor = ColumnTransformer(
-        [("numeric", Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]), feature_columns)],
-        remainder="drop",
-    )
-    tree_preprocessor = ColumnTransformer(
-        [("numeric", SimpleImputer(strategy="median"), feature_columns)],
-        remainder="drop",
-    )
+    preprocessor = make_preprocessor(numeric_columns, categorical_columns, scale_numeric=True)
+    tree_preprocessor = make_preprocessor(numeric_columns, categorical_columns, scale_numeric=False)
 
     model_specs: dict[str, tuple[str, object]] = {
         "linear_regression": ("regression", Pipeline([("prep", preprocessor), ("model", LinearRegression())])),
@@ -200,6 +196,8 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
         "dataset_path": str(config.dataset_path),
         "rows": dataset.height,
         "feature_columns": feature_columns,
+        "numeric_feature_columns": numeric_columns,
+        "categorical_feature_columns": categorical_columns,
         "model_paths": model_paths,
         "split_ranges": split_ranges(splits),
     }
@@ -222,8 +220,49 @@ def import_optional(module_name: str):
         return None
 
 
+def make_preprocessor(
+    numeric_columns: list[str],
+    categorical_columns: list[str],
+    scale_numeric: bool,
+):
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    transformers = []
+    if numeric_columns:
+        steps = [("imputer", SimpleImputer(strategy="median"))]
+        if scale_numeric:
+            steps.append(("scaler", StandardScaler()))
+        transformers.append(("numeric", Pipeline(steps), numeric_columns))
+    if categorical_columns:
+        transformers.append(
+            (
+                "categorical",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+                    ]
+                ),
+                categorical_columns,
+            )
+        )
+    return ColumnTransformer(transformers, remainder="drop")
+
+
 def feature_importance(pipeline: object, feature_columns: list[str]) -> list[dict[str, object]]:
     model = pipeline.named_steps.get("model") if hasattr(pipeline, "named_steps") else pipeline
+    names = feature_columns
+    if hasattr(pipeline, "named_steps") and "prep" in pipeline.named_steps:
+        try:
+            names = [
+                name.replace("numeric__", "").replace("categorical__", "")
+                for name in pipeline.named_steps["prep"].get_feature_names_out()
+            ]
+        except Exception:
+            names = feature_columns
     values = None
     if hasattr(model, "feature_importances_"):
         values = list(model.feature_importances_)
@@ -236,7 +275,7 @@ def feature_importance(pipeline: object, feature_columns: list[str]) -> list[dic
     if values is None:
         return []
     return sorted(
-        [{"feature": feature, "importance": float(value)} for feature, value in zip(feature_columns, values)],
+        [{"feature": feature, "importance": float(value)} for feature, value in zip(names, values)],
         key=lambda x: x["importance"],
         reverse=True,
     )
