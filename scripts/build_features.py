@@ -27,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon-seconds", type=int, default=10)
     parser.add_argument("--classification-theta-bps", type=float, default=5.0)
     parser.add_argument("--entry-threshold-bps", type=float, default=8.0)
+    parser.add_argument("--strategy-entry-threshold-price", type=float, default=0.04)
+    parser.add_argument("--two-leg-max-total-price", type=float, default=0.96)
+    parser.add_argument("--two-leg-no-fill-edge", type=float, default=-1.0)
+    parser.add_argument("--two-leg-maker-fill-trade-side", default="SELL")
+    parser.add_argument("--final-profit-success-price", type=float, default=0.02)
     parser.add_argument("--taker-cost-bps", type=float, default=0.0)
     parser.add_argument("--slippage-buffer-bps", type=float, default=2.0)
     parser.add_argument("--safety-margin-bps", type=float, default=1.0)
@@ -49,6 +54,11 @@ def main() -> None:
         horizon_seconds=args.horizon_seconds,
         classification_theta_bps=args.classification_theta_bps,
         entry_threshold_bps=args.entry_threshold_bps,
+        strategy_entry_threshold_price=args.strategy_entry_threshold_price,
+        two_leg_max_total_price=args.two_leg_max_total_price,
+        two_leg_no_fill_edge=args.two_leg_no_fill_edge,
+        two_leg_maker_fill_trade_side=args.two_leg_maker_fill_trade_side,
+        final_profit_success_price=args.final_profit_success_price,
         taker_cost_bps=args.taker_cost_bps,
         slippage_buffer_bps=args.slippage_buffer_bps,
         safety_margin_bps=args.safety_margin_bps,

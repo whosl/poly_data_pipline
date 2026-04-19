@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-cls", default="y_cls_10s")
     parser.add_argument("--taker-cost-bps", type=float, default=0.0)
     parser.add_argument("--prediction-thresholds", nargs="*", type=float, default=None)
+    parser.add_argument("--split-purge-ms", type=int, default=0)
+    parser.add_argument("--split-embargo-ms", type=int, default=0)
     return parser.parse_args()
 
 
@@ -34,6 +36,8 @@ def main() -> None:
         target_cls=args.target_cls,
         taker_cost_bps=args.taker_cost_bps,
         prediction_thresholds=args.prediction_thresholds,
+        split_purge_ms=args.split_purge_ms,
+        split_embargo_ms=args.split_embargo_ms,
     )
     print(f"models={len(report['models'])}")
     print(f"summary={args.output_dir / 'summary_metrics.json'}")

@@ -18,6 +18,11 @@ class DatasetConfig:
     horizon_seconds: int = 10
     classification_theta_bps: float = 5.0
     entry_threshold_bps: float = 8.0
+    strategy_entry_threshold_price: float = 0.04
+    two_leg_max_total_price: float = 0.96
+    two_leg_no_fill_edge: float = -1.0
+    two_leg_maker_fill_trade_side: str = "SELL"
+    final_profit_success_price: float = 0.02
     taker_cost_bps: float = 0.0
     slippage_buffer_bps: float = 2.0
     safety_margin_bps: float = 1.0
@@ -34,15 +39,18 @@ class TrainConfig:
     train_fraction: float = 0.70
     validation_fraction: float = 0.15
     test_fraction: float = 0.15
+    split_purge_ms: int = 0
+    split_embargo_ms: int = 0
     random_seed: int = 42
+    sample_weight_col: str | None = None
     models: list[str] = field(
         default_factory=lambda: [
-            "ridge_regression",
-            "linear_regression",
             "logistic_regression",
-            "lightgbm_regressor",
+            "sgd_logistic_classifier",
+            "gaussian_nb_classifier",
+            "random_forest_classifier",
+            "extra_trees_classifier",
             "lightgbm_classifier",
-            "xgboost_regressor",
             "xgboost_classifier",
         ]
     )
@@ -66,4 +74,3 @@ def dataclass_to_json_dict(obj: object) -> dict[str, Any]:
         if isinstance(value, Path):
             data[key] = str(value)
     return data
-

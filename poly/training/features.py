@@ -12,7 +12,14 @@ import structlog
 from poly.metadata.polymarket import enrich_with_metadata
 from poly.training.config import DatasetConfig, dataclass_to_json_dict, save_json
 from poly.training.io import TableLoadResult, concat_non_empty, load_date_tables, schema_report
-from poly.training.labels import add_alpha_labels, add_entry_net_edge, maker_fill_label_design
+from poly.training.labels import (
+    add_alpha_labels,
+    add_entry_net_edge,
+    add_final_profit_labels,
+    add_strategy_entry_labels,
+    add_two_leg_maker_fill_labels,
+    maker_fill_label_design,
+)
 
 logger = structlog.get_logger()
 
@@ -70,8 +77,8 @@ def build_date_dataset(
     samples = sample_book(book, config.sample_interval_ms)
     samples = add_lob_features(samples)
     samples = add_book_event_features(samples, book)
-    poly_trades = enrich_with_metadata(get_frame(tables, "poly_trades"), metadata)
-    samples = add_trade_features(samples, canonicalize_trades(poly_trades))
+    poly_trades = canonicalize_trades(enrich_with_metadata(get_frame(tables, "poly_trades"), metadata))
+    samples = add_trade_features(samples, poly_trades)
     samples = add_binance_features(
         samples,
         canonicalize_binance_book(tables),
@@ -79,7 +86,7 @@ def build_date_dataset(
         config.join_tolerance_ms,
     )
     samples = add_research_buckets(samples, get_frame(tables, "poly_enriched_book"), config.join_tolerance_ms)
-    samples = add_future_mid_labels(samples, book, [1, 3, 5, 10], config.join_tolerance_ms)
+    samples = add_future_book_labels(samples, book, [1, 3, 5, 10], config.join_tolerance_ms)
     samples = add_alpha_labels(
         samples,
         horizon_seconds=config.horizon_seconds,
@@ -92,6 +99,24 @@ def build_date_dataset(
         taker_cost_bps=config.taker_cost_bps,
         slippage_buffer_bps=config.slippage_buffer_bps,
         safety_margin_bps=config.safety_margin_bps,
+    )
+    samples = add_strategy_entry_labels(
+        samples,
+        horizon_seconds=config.horizon_seconds,
+        entry_threshold_price=config.strategy_entry_threshold_price,
+    )
+    samples = add_two_leg_maker_fill_labels(
+        samples,
+        trades=poly_trades,
+        horizon_seconds=config.horizon_seconds,
+        max_total_price=config.two_leg_max_total_price,
+        no_fill_edge=config.two_leg_no_fill_edge,
+        maker_fill_trade_side=config.two_leg_maker_fill_trade_side,
+    )
+    samples = add_final_profit_labels(
+        samples,
+        horizon_seconds=config.horizon_seconds,
+        success_profit=config.final_profit_success_price,
     )
     return filter_training_rows(samples, config)
 
@@ -657,12 +682,32 @@ def add_future_mid_labels(
     horizons_seconds: list[int],
     tolerance_ms: int,
 ) -> pl.DataFrame:
+    return add_future_book_labels(samples, book, horizons_seconds, tolerance_ms)
+
+
+def add_future_book_labels(
+    samples: pl.DataFrame,
+    book: pl.DataFrame,
+    horizons_seconds: list[int],
+    tolerance_ms: int,
+) -> pl.DataFrame:
     df = samples
-    future_book = book.select(["market_id", "asset_id", "recv_ns", "current_mid"]).sort(["market_id", "asset_id", "recv_ns"])
+    future_book = book.select(["market_id", "asset_id", "recv_ns", "current_mid", "best_bid", "best_ask"]).sort(
+        ["market_id", "asset_id", "recv_ns"]
+    )
     for horizon in horizons_seconds:
         target_ns_col = f"_target_ns_{horizon}s"
         future_col = f"future_mid_{horizon}s"
-        future = future_book.rename({"current_mid": future_col, "recv_ns": "_future_recv_ns"})
+        future_bid_col = f"future_best_bid_{horizon}s"
+        future_ask_col = f"future_best_ask_{horizon}s"
+        future = future_book.rename(
+            {
+                "current_mid": future_col,
+                "best_bid": future_bid_col,
+                "best_ask": future_ask_col,
+                "recv_ns": "_future_recv_ns",
+            }
+        )
         df = df.with_columns((pl.col("recv_ns") + horizon * NS_PER_SECOND).alias(target_ns_col))
         df = join_asof_by_group(
             df,
@@ -742,7 +787,20 @@ def filter_training_rows(samples: pl.DataFrame, config: DatasetConfig) -> pl.Dat
 
 
 def infer_feature_columns(df: pl.DataFrame) -> list[str]:
-    excluded_prefixes = ("future_mid_", "markout_", "y_", "date")
+    excluded_prefixes = (
+        "future_mid_",
+        "future_best_bid_",
+        "future_best_ask_",
+        "markout_",
+        "y_",
+        "date",
+        "strategy_entry_edge_",
+        "future_opposite_maker_fill_",
+        "two_leg_",
+        "first_unwind_loss_proxy_",
+        "final_profit_",
+        "final_profit_weight_",
+    )
     excluded = {
         "recv_ns",
         "exchange_ts",
@@ -757,6 +815,7 @@ def infer_feature_columns(df: pl.DataFrame) -> list[str]:
         "period",
         "question",
         "expiry_ns",
+        "opposite_asset_id",
         "realized_edge_after_entry_cost_bps",
     }
     numeric = {pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64}
@@ -783,7 +842,19 @@ def make_metadata(
     table_report: list[dict[str, object]],
     quality: list[dict[str, object]],
 ) -> dict[str, object]:
-    label_columns = [c for c in dataset.columns if c.startswith("y_") or c.startswith("future_mid_") or c.startswith("markout_")]
+    label_columns = [
+        c
+        for c in dataset.columns
+        if c.startswith("y_")
+        or c.startswith("future_mid_")
+        or c.startswith("markout_")
+        or c.startswith("strategy_entry_edge_")
+        or c.startswith("future_opposite_maker_fill_")
+        or c.startswith("two_leg_")
+        or c.startswith("first_unwind_loss_proxy_")
+        or c.startswith("final_profit_")
+        or c.startswith("final_profit_weight_")
+    ]
     feature_columns = infer_feature_columns(dataset) if not dataset.is_empty() else []
     if dataset.is_empty() or "recv_ns" not in dataset.columns:
         date_range = {"start_ns": None, "end_ns": None}

@@ -27,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-fraction", type=float, default=0.70)
     parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--test-fraction", type=float, default=0.15)
+    parser.add_argument("--split-purge-ms", type=int, default=0)
+    parser.add_argument("--split-embargo-ms", type=int, default=0)
+    parser.add_argument("--sample-weight-col", default=None)
     return parser.parse_args()
 
 
@@ -40,6 +43,9 @@ def main() -> None:
         train_fraction=args.train_fraction,
         validation_fraction=args.validation_fraction,
         test_fraction=args.test_fraction,
+        split_purge_ms=args.split_purge_ms,
+        split_embargo_ms=args.split_embargo_ms,
+        sample_weight_col=args.sample_weight_col,
     )
     if args.models is not None:
         config.models = args.models

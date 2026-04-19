@@ -31,9 +31,12 @@ class TrainedArtifacts:
 def train_baselines(config: TrainConfig) -> TrainedArtifacts:
     ensure_sklearn()
     from sklearn.compose import ColumnTransformer
+    from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
     from sklearn.impute import SimpleImputer
     from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+    from sklearn.naive_bayes import GaussianNB
     from sklearn.pipeline import Pipeline
+    from sklearn.linear_model import SGDClassifier
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
     dataset = pl.read_parquet(str(config.dataset_path))
@@ -48,6 +51,8 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
         train_fraction=config.train_fraction,
         validation_fraction=config.validation_fraction,
         test_fraction=config.test_fraction,
+        purge_ms=config.split_purge_ms,
+        embargo_ms=config.split_embargo_ms,
     )
     train_df = splits["train"].drop_nulls([config.target_reg, config.target_cls])
     if train_df.is_empty():
@@ -69,6 +74,67 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
                         LogisticRegression(
                             max_iter=1000,
                             class_weight="balanced",
+                            random_state=config.random_seed,
+                        ),
+                    ),
+                ]
+            ),
+        ),
+        "sgd_logistic_classifier": (
+            "classification",
+            Pipeline(
+                [
+                    ("prep", preprocessor),
+                    (
+                        "model",
+                        SGDClassifier(
+                            loss="log_loss",
+                            alpha=0.0001,
+                            max_iter=1000,
+                            tol=1e-3,
+                            class_weight="balanced",
+                            random_state=config.random_seed,
+                        ),
+                    ),
+                ]
+            ),
+        ),
+        "gaussian_nb_classifier": (
+            "classification",
+            Pipeline([("prep", tree_preprocessor), ("model", GaussianNB())]),
+        ),
+        "random_forest_classifier": (
+            "classification",
+            Pipeline(
+                [
+                    ("prep", tree_preprocessor),
+                    (
+                        "model",
+                        RandomForestClassifier(
+                            n_estimators=100,
+                            max_depth=8,
+                            min_samples_leaf=50,
+                            class_weight="balanced_subsample",
+                            n_jobs=-1,
+                            random_state=config.random_seed,
+                        ),
+                    ),
+                ]
+            ),
+        ),
+        "extra_trees_classifier": (
+            "classification",
+            Pipeline(
+                [
+                    ("prep", tree_preprocessor),
+                    (
+                        "model",
+                        ExtraTreesClassifier(
+                            n_estimators=100,
+                            max_depth=8,
+                            min_samples_leaf=50,
+                            class_weight="balanced",
+                            n_jobs=-1,
                             random_state=config.random_seed,
                         ),
                     ),
@@ -170,13 +236,19 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
         if name not in config.models:
             continue
         target = config.target_reg if task == "regression" else config.target_cls
-        fit_df = train_df.drop_nulls([target])
+        required_cols = [target]
+        if config.sample_weight_col and config.sample_weight_col in train_df.columns:
+            required_cols.append(config.sample_weight_col)
+        fit_df = train_df.drop_nulls(required_cols)
         if fit_df.is_empty():
             logger.warning("skip_empty_target", model=name, target=target)
             continue
         x_train = fit_df.select(feature_columns).to_pandas()
         y_train = fit_df[target].to_pandas()
-        pipeline.fit(x_train, y_train)
+        sample_weight = None
+        if config.sample_weight_col and config.sample_weight_col in fit_df.columns:
+            sample_weight = fit_df[config.sample_weight_col].to_pandas()
+        fit_model(pipeline, x_train, y_train, sample_weight)
         path = config.output_dir / f"{name}.joblib"
         joblib.dump(
             {
@@ -202,6 +274,7 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
         "numeric_feature_columns": numeric_columns,
         "categorical_feature_columns": categorical_columns,
         "model_paths": model_paths,
+        "sample_weight_col": config.sample_weight_col,
         "split_ranges": split_ranges(splits),
     }
     save_json(metadata, config.output_dir / "training_metadata.json")
@@ -221,6 +294,17 @@ def import_optional(module_name: str):
     except Exception as exc:
         logger.warning("optional_model_import_failed", module=module_name, error=str(exc))
         return None
+
+
+def fit_model(pipeline: object, x_train, y_train, sample_weight) -> None:
+    if sample_weight is None:
+        pipeline.fit(x_train, y_train)
+        return
+    try:
+        pipeline.fit(x_train, y_train, model__sample_weight=sample_weight)
+    except TypeError as exc:
+        logger.warning("sample_weight_unsupported", error=str(exc))
+        pipeline.fit(x_train, y_train)
 
 
 def make_preprocessor(
@@ -273,12 +357,15 @@ class LabelEncodedClassifier(ClassifierMixin, BaseEstimator):
     def __init__(self, estimator):
         self.estimator = estimator
 
-    def fit(self, x, y):
+    def fit(self, x, y, sample_weight=None):
         from sklearn.preprocessing import LabelEncoder
 
         self.label_encoder_ = LabelEncoder()
         encoded = self.label_encoder_.fit_transform(y)
-        self.estimator.fit(x, encoded)
+        if sample_weight is None:
+            self.estimator.fit(x, encoded)
+        else:
+            self.estimator.fit(x, encoded, sample_weight=sample_weight)
         self.classes_ = self.label_encoder_.classes_
         return self
 

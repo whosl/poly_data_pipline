@@ -122,9 +122,41 @@ python -m poly.main labels 20260417
 - `markout_*s_bps` — markout（基点）
 - `imbalance_bucket / spread_bucket / price_bucket` — 分位桶
 
-### 训练 10 秒 markout baseline
+### 训练目标和目标策略
 
-训练管线优先使用 `data/normalized` 和 `data/research` 里的 Parquet，不直接从 raw JSONL 训练。第一版目标是验证 10 秒短周期 markout 是否有稳定可交易信号，而不是预测最终市场结算。
+训练管线优先使用 `data/normalized` 和 `data/research` 里的 Parquet，不直接从 raw JSONL 训练。当前训练目标不是预测 Polymarket 最终结算方向，而是验证 BTC/ETH Up/Down 市场里是否存在 5s/10s 级别的可交易微观结构 edge。
+
+目标策略是 two-leg round trip：
+
+1. 第一腿：用 taker 直接买入当前 asset，成交价近似为当前 `best_ask`。
+2. 第二腿：在 opposite outcome 上挂 maker，目标是在 10 秒内用更好的价格补上反向腿。
+3. 交易判定：如果 `first_leg_ask + future_opposite_maker_fill_price <= 0.96`，认为这次 entry 有足够空间 cover fee/slippage/safety margin。
+4. 当前简化收益：成功记 `+0.02`，失败用同腿未来 bid 卖出撤退，亏损近似为 `-max(first_leg_ask - future_best_bid_10s, 0)`。这里的 `future_best_bid_10s` 是当前样本同一个 asset 的未来 bid label。
+
+因此当前最重要的模型不是“最终涨跌模型”，而是 `p_enter` classifier：给定当前订单簿、Binance 参考行情、regime 状态，预测这笔 first-leg taker entry 后，第二腿 maker 是否有机会在 10 秒内让 round trip 成立。
+
+当前训练分三层推进：
+
+| 层 | 目标 | 当前状态 |
+|----|------|----------|
+| Layer 1 alpha | 预测 1s/3s/5s/10s markout 或短周期方向 | 已实现，主要用于 sanity check |
+| Layer 2 entry | 预测 first-leg taker entry 是否值得做 | 已实现为 `y_final_profit_entry_10s` classifier，是当前主线 |
+| Layer 3 exit/fill | 预测 second-leg maker fill 概率、fill 质量、失败强平价格 | 有派生标签雏形，仍需更保守的 queue/fill replay |
+
+关键标签定义：
+
+| 字段 | 含义 |
+|------|------|
+| `future_mid_10s`, `markout_10s_bps` | 传统 10 秒 markout 标签，用来做 alpha baseline |
+| `future_best_bid_10s`, `future_best_ask_10s` | 当前 asset 未来 10 秒 book label，只能用于标签/评估，禁止作为特征 |
+| `future_opposite_maker_fill_price_10s` | 10 秒内 opposite asset 上可观察到的 maker fill 价格证据 |
+| `two_leg_total_price_10s` | `best_ask + future_opposite_maker_fill_price_10s` |
+| `y_two_leg_entry_10s` | `two_leg_total_price_10s <= 0.96` 时为 `enter` |
+| `first_unwind_loss_proxy_10s` | 第二腿失败时，第一腿用未来同腿 best bid 撤退的亏损 proxy |
+| `final_profit_10s` | 成功 `+0.02`，失败 `-first_unwind_loss_proxy_10s` |
+| `y_final_profit_entry_10s` | 当前主训练分类目标：`final_profit_10s > 0` 为 `enter` |
+
+训练时只能使用当下可见 feature。所有 `future_*`、`markout_*`、`two_leg_*`、`final_profit_*`、`y_*` 列都属于未来标签/评估列，禁止进模型。
 
 给后续 coding agent 的详细接手说明见 [`docs/training_agent_guide.md`](docs/training_agent_guide.md)。
 
@@ -175,12 +207,47 @@ python scripts/evaluate_alpha_model.py \
   --taker-cost-bps 0
 ```
 
+严格做 two-leg entry 实验时，不要用 test top-K 反推阈值。先用 validation set 选择 `p_enter` cutoff，再把这个 cutoff 原样打到 test set。因为 10 秒标签会和边界附近样本重叠，建议同时开启 10 秒 purge/embargo。
+
+当前推荐主实验：
+
+```bash
+# 训练 finalProfit entry classifier，第一腿 ask，第二腿 opposite maker fill，总价格 <= 0.96
+python scripts/train_alpha_model.py \
+  --dataset artifacts/training/alpha_dataset.parquet \
+  --output-dir artifacts/training/strict_models \
+  --target-reg final_profit_10s \
+  --target-cls y_final_profit_entry_10s \
+  --sample-weight-col final_profit_weight_10s \
+  --split-purge-ms 10000 \
+  --split-embargo-ms 10000
+
+# 用 validation 选 cutoff，再固定到 test
+python scripts/select_entry_cutoffs.py \
+  --output-dir artifacts/training/cutoff_selection \
+  --split-purge-ms 10000 \
+  --split-embargo-ms 10000 \
+  --target-profit final_profit_10s \
+  --target-cls y_final_profit_entry_10s \
+  --run btc_only artifacts/training/btc_only/alpha_dataset.parquet artifacts/training/btc_only/alpha_dataset.parquet artifacts/training/btc_only/strict_models
+```
+
+当前 `20260417` strict no-leak sanity check 里，最好的候选是 BTC-only RandomForest：
+
+| 实验 | 模型 | validation 选出的 cutoff | test entries | test avg `final_profit_10s` | test success rate |
+|------|------|--------------------------|--------------|-----------------------------|-------------------|
+| BTC-only | RandomForest | `p_enter >= 0.74` | 60 | `+0.01117` | 78.33% |
+| mixed BTC+ETH | RandomForest | `p_enter >= 0.73` | 82 | `+0.00780` | 73.17% |
+
+这些结果只能证明 pipeline 有希望，不是生产策略证据。当前数据仍是单日期样本，second-leg fill 还是基于未来 opposite trade evidence 的简化派生，不是完整 queue simulation。
+
 产物：
 - `alpha_dataset.parquet/csv` — 特征、10s markout 回归目标、三分类目标、entry-worthiness label
 - `alpha_dataset_metadata.json` — 输入 schema、坏文件报告、特征列、标签列、日期范围、采样配置
-- `models/*.joblib` — ridge/linear/logistic baseline；LightGBM/XGBoost 若环境已安装则自动启用
+- `models/*.joblib` — 默认训练 7 个 classifier：logistic、SGD logistic、GaussianNB、RandomForest、ExtraTrees、LightGBM、XGBoost
 - `evaluation/summary_metrics.json` — MAE/RMSE/rank correlation、precision/recall/F1、阈值 entry EV
 - `evaluation/*_by_*_bucket.csv` 和 `*.png` — 按 spread/imbalance/expiry/price 等 regime 的表现
+- `cutoff_selection/validation_selected_cutoffs_test_results.csv` — validation-selected cutoff 在 test 上的最终表现
 
 ### 回放
 

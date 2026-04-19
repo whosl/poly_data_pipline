@@ -22,10 +22,12 @@ def evaluate_dataset_models(
     target_cls: str = "y_cls_10s",
     taker_cost_bps: float = 0.0,
     prediction_thresholds: list[float] | None = None,
+    split_purge_ms: int = 0,
+    split_embargo_ms: int = 0,
 ) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset = pl.read_parquet(str(dataset_path))
-    splits = chronological_split(dataset)
+    splits = chronological_split(dataset, purge_ms=split_purge_ms, embargo_ms=split_embargo_ms)
     eval_df = splits["test"]
     if eval_df.is_empty():
         raise ValueError("test split is empty")
@@ -35,6 +37,8 @@ def evaluate_dataset_models(
     reports: dict[str, object] = {
         "dataset_path": str(dataset_path),
         "model_dir": str(model_dir),
+        "split_purge_ms": split_purge_ms,
+        "split_embargo_ms": split_embargo_ms,
         "split_ranges": split_ranges(splits),
         "models": {},
     }
@@ -60,14 +64,18 @@ def evaluate_dataset_models(
             if hasattr(model, "predict_proba"):
                 proba = model.predict_proba(x_eval)
                 classes = list(model.classes_) if hasattr(model, "classes_") else list(model.named_steps["model"].classes_)
-                if "up" in classes:
-                    up_idx = classes.index("up")
-                    scored = scored.with_columns(pl.Series("prediction_up_proba", proba[:, up_idx]))
+                positive_class = choose_positive_class(classes)
+                if positive_class in classes:
+                    positive_idx = classes.index(positive_class)
+                    scored = scored.with_columns(pl.Series("prediction_positive_proba", proba[:, positive_idx]))
+                    if positive_class == "up":
+                        scored = scored.with_columns(pl.Series("prediction_up_proba", proba[:, positive_idx]))
                 scored = scored.with_columns(pl.Series("prediction_confidence", proba.max(axis=1)))
+                model_report["positive_class"] = positive_class
             model_report.update(classification_metrics(scored, target_cls))
-            if "prediction_up_proba" in scored.columns:
-                model_report["trading_thresholds"] = proba_threshold_eval(scored, target_reg, "prediction_up_proba", taker_cost_bps)
-                plot_confidence(scored.rename({"prediction_up_proba": "prediction"}), output_dir / f"{path.stem}_confidence_buckets.png", target_reg)
+            if "prediction_positive_proba" in scored.columns:
+                model_report["trading_thresholds"] = proba_threshold_eval(scored, target_reg, "prediction_positive_proba", taker_cost_bps)
+                plot_confidence(scored.rename({"prediction_positive_proba": "prediction"}), output_dir / f"{path.stem}_confidence_buckets.png", target_reg)
         reports["models"][path.stem] = model_report
 
     save_json(reports, output_dir / "summary_metrics.json")
@@ -96,7 +104,10 @@ def classification_metrics(df: pl.DataFrame, target: str) -> dict[str, object]:
         return {"precision_macro": None, "recall_macro": None, "f1_macro": None, "confusion_matrix": []}
     y = clean[target].to_list()
     pred = clean["prediction_class"].to_list()
-    labels = ["down", "neutral", "up"]
+    preferred = ["down", "neutral", "up", "skip", "enter"]
+    observed = list(dict.fromkeys(y + pred))
+    labels = [label for label in preferred if label in observed]
+    labels.extend([label for label in observed if label not in labels])
     return {
         "precision_macro": float(precision_score(y, pred, labels=labels, average="macro", zero_division=0)),
         "recall_macro": float(recall_score(y, pred, labels=labels, average="macro", zero_division=0)),
@@ -104,6 +115,13 @@ def classification_metrics(df: pl.DataFrame, target: str) -> dict[str, object]:
         "confusion_matrix_labels": labels,
         "confusion_matrix": confusion_matrix(y, pred, labels=labels).tolist(),
     }
+
+
+def choose_positive_class(classes: list[object]) -> object | None:
+    for label in ["enter", "up", 1, "1", True]:
+        if label in classes:
+            return label
+    return classes[-1] if classes else None
 
 
 def threshold_eval(
@@ -139,14 +157,28 @@ def selection_stats(
     prefix: dict[str, float],
 ) -> dict[str, float | int]:
     if selected.is_empty():
-        return {**prefix, "candidate_entries": 0, "avg_realized_markout_bps": None, "win_rate": None, "ev_after_taker_cost_bps": None}
+        return {
+            **prefix,
+            "candidate_entries": 0,
+            "avg_realized_target": None,
+            "median_realized_target": None,
+            "success_rate": None,
+            "avg_realized_markout_bps": None,
+            "win_rate": None,
+            "ev_after_taker_cost_bps": None,
+        }
     realized = selected[target]
+    avg_target = float(realized.mean())
+    success_rate = float((realized > 0).mean())
     return {
         **prefix,
         "candidate_entries": selected.height,
-        "avg_realized_markout_bps": float(realized.mean()),
-        "win_rate": float((realized > 0).mean()),
-        "ev_after_taker_cost_bps": float(realized.mean() - taker_cost_bps),
+        "avg_realized_target": avg_target,
+        "median_realized_target": float(realized.median()),
+        "success_rate": success_rate,
+        "avg_realized_markout_bps": avg_target,
+        "win_rate": success_rate,
+        "ev_after_taker_cost_bps": float(avg_target - taker_cost_bps),
     }
 
 
@@ -220,4 +252,3 @@ def rank_corr(a: np.ndarray, b: np.ndarray) -> float | None:
     if np.std(ar) == 0 or np.std(br) == 0:
         return None
     return float(np.corrcoef(ar, br)[0, 1])
-
