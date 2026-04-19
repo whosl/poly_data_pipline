@@ -10,6 +10,7 @@ import importlib.util
 import joblib
 import polars as pl
 import structlog
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 from poly.training.config import TrainConfig, dataclass_to_json_dict, save_json
 from poly.training.features import infer_feature_columns
@@ -146,12 +147,14 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
                         ("prep", tree_preprocessor),
                         (
                             "model",
-                            xgb.XGBClassifier(
-                                n_estimators=300,
-                                learning_rate=0.03,
-                                max_depth=4,
-                                random_state=config.random_seed,
-                                eval_metric="mlogloss",
+                            LabelEncodedClassifier(
+                                xgb.XGBClassifier(
+                                    n_estimators=300,
+                                    learning_rate=0.03,
+                                    max_depth=4,
+                                    random_state=config.random_seed,
+                                    eval_metric="mlogloss",
+                                )
                             ),
                         ),
                     ]
@@ -260,6 +263,43 @@ def is_categorical_feature(col: str, dtype: pl.DataType) -> bool:
         "vol_bucket",
     }
     return col in categorical_feature_names or dtype in {pl.String, pl.Categorical, pl.Enum}
+
+
+class LabelEncodedClassifier(ClassifierMixin, BaseEstimator):
+    """Wrap classifiers that require numeric labels while exposing original labels."""
+
+    _estimator_type = "classifier"
+
+    def __init__(self, estimator):
+        self.estimator = estimator
+
+    def fit(self, x, y):
+        from sklearn.preprocessing import LabelEncoder
+
+        self.label_encoder_ = LabelEncoder()
+        encoded = self.label_encoder_.fit_transform(y)
+        self.estimator.fit(x, encoded)
+        self.classes_ = self.label_encoder_.classes_
+        return self
+
+    def predict(self, x):
+        encoded = self.estimator.predict(x)
+        return self.label_encoder_.inverse_transform(encoded.astype(int))
+
+    def predict_proba(self, x):
+        return self.estimator.predict_proba(x)
+
+    @property
+    def feature_importances_(self):
+        if not hasattr(self.estimator, "feature_importances_"):
+            raise AttributeError("wrapped estimator has no feature_importances_")
+        return self.estimator.feature_importances_
+
+    @property
+    def coef_(self):
+        if not hasattr(self.estimator, "coef_"):
+            raise AttributeError("wrapped estimator has no coef_")
+        return self.estimator.coef_
 
 
 def feature_importance(pipeline: object, feature_columns: list[str]) -> list[dict[str, object]]:
