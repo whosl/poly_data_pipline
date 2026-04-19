@@ -39,7 +39,7 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
     feature_columns = infer_feature_columns(dataset)
     if not feature_columns:
         raise ValueError("no feature columns found")
-    categorical_columns = [col for col in feature_columns if dataset.schema[col] == pl.String]
+    categorical_columns = [col for col in feature_columns if is_categorical_feature(col, dataset.schema[col])]
     numeric_columns = [col for col in feature_columns if col not in categorical_columns]
 
     splits = chronological_split(
@@ -250,6 +250,16 @@ def make_preprocessor(
             )
         )
     return ColumnTransformer(transformers, remainder="drop")
+
+
+def is_categorical_feature(col: str, dtype: pl.DataType) -> bool:
+    categorical_feature_names = {
+        "imbalance_bucket",
+        "spread_bucket",
+        "price_bucket",
+        "vol_bucket",
+    }
+    return col in categorical_feature_names or dtype in {pl.String, pl.Categorical, pl.Enum}
 
 
 def feature_importance(pipeline: object, feature_columns: list[str]) -> list[dict[str, object]]:
