@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from typing import Iterable
@@ -42,7 +42,7 @@ def metadata_path(data_dir: Path, date: str) -> Path:
 
 def updown_slugs_for_date(date: str) -> list[str]:
     """Generate expected BTC/ETH UpDown market slugs for a UTC date."""
-    day = datetime.strptime(date, "%Y%m%d").replace(tzinfo=UTC)
+    day = datetime.strptime(date, "%Y%m%d").replace(tzinfo=timezone.utc)
     end = day + timedelta(days=1)
     slugs: list[str] = []
     for symbol, period_label, period_seconds in UPDOWN_MARKETS:
@@ -376,7 +376,7 @@ def write_metadata_by_date(frame: pl.DataFrame, data_dir: Path, dates: Iterable[
         return []
     paths: list[Path] = []
     for date in dates:
-        start = int(datetime.strptime(date, "%Y%m%d").replace(tzinfo=UTC).timestamp() * 1_000_000_000)
+        start = int(datetime.strptime(date, "%Y%m%d").replace(tzinfo=timezone.utc).timestamp() * 1_000_000_000)
         end = start + 24 * 60 * 60 * 1_000_000_000
         date_frame = frame.filter(
             ((pl.col("expiry_ns").is_null()) | ((pl.col("expiry_ns") >= start) & (pl.col("expiry_ns") <= end + 900 * 1_000_000_000)))

@@ -25,13 +25,15 @@ class BinanceWS:
     """WebSocket client for Binance combined streams."""
 
     def __init__(self, config: Config, raw_writer: RawWriter,
-                 bba_writer: ParquetWriter, trade_writer: ParquetWriter,
-                 book_writer: ParquetWriter) -> None:
+                 bba_writer: ParquetWriter | None, trade_writer: ParquetWriter | None,
+                 book_writer: ParquetWriter | None,
+                 raw_only: bool = False) -> None:
         self.config = config
         self.raw_writer = raw_writer
         self.bba_writer = bba_writer
         self.trade_writer = trade_writer
         self.book_writer = book_writer
+        self.raw_only = raw_only
         self._clock_offset_ns: int = 0
         self._msg_count = 0
 
@@ -85,14 +87,19 @@ class BinanceWS:
 
                     if stream.endswith("@bookTicker"):
                         await self.raw_writer.write_obj(envelope, recv_ns)
-                        self._handle_book_ticker(data, recv_ns)
+                        if not self.raw_only:
+                            self._handle_book_ticker(data, recv_ns)
                     elif stream.endswith("@aggTrade"):
                         await self.raw_writer.write_obj(envelope, recv_ns)
-                        self._handle_agg_trade(data, recv_ns)
+                        if not self.raw_only:
+                            self._handle_agg_trade(data, recv_ns)
                     elif "@depth" in stream:
-                        row = self._handle_depth(data, recv_ns, stream)
-                        if row is not None:
-                            await self.raw_writer.write_obj(compact_depth_envelope(stream, row), recv_ns)
+                        if self.raw_only:
+                            await self.raw_writer.write_obj(envelope, recv_ns)
+                        else:
+                            row = self._handle_depth(data, recv_ns, stream)
+                            if row is not None:
+                                await self.raw_writer.write_obj(compact_depth_envelope(stream, row), recv_ns)
         finally:
             clock_task.cancel()
 

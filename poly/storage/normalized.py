@@ -150,8 +150,13 @@ class ParquetWriter:
         self._writer: pq.ParquetWriter | None = None
         self._current_date: str = ""
         self._total_rows: int = 0
+        self._last_day_ns: int = 0
 
     def _date_from_ns(self, recv_ns: int) -> str:
+        day_ns = recv_ns - (recv_ns % 86_400_000_000_000)
+        if day_ns == self._last_day_ns:
+            return self._current_date
+        self._last_day_ns = day_ns
         dt = datetime.fromtimestamp(recv_ns / 1e9, tz=timezone.utc)
         return dt.strftime("%Y%m%d")
 

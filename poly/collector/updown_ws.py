@@ -115,14 +115,16 @@ class UpDownCollector:
     """Collects Polymarket Up/Down markets with automatic rotation."""
 
     def __init__(self, config: Config, raw_writer: RawWriter,
-                 book_writer: ParquetWriter, trade_writer: ParquetWriter,
-                 bba_writer: ParquetWriter, engine: OrderBookEngine) -> None:
+                 book_writer: ParquetWriter | None, trade_writer: ParquetWriter | None,
+                 bba_writer: ParquetWriter | None, engine: OrderBookEngine | None = None,
+                 raw_only: bool = False) -> None:
         self.config = config
         self.raw_writer = raw_writer
         self.book_writer = book_writer
         self.trade_writer = trade_writer
         self.bba_writer = bba_writer
         self.engine = engine
+        self.raw_only = raw_only
         self._ws = None
         self._subscribed_assets: dict[str, str] = {}  # asset_id -> slug
         self._asset_metadata: dict[str, dict[str, object]] = {}
@@ -188,8 +190,9 @@ class UpDownCollector:
 
                     await self.raw_writer.write(message if isinstance(message, bytes) else message.encode(), recv_ns)
 
-                    for msg in relevant_messages:
-                        self._dispatch(msg, recv_ns)
+                    if not self.raw_only:
+                        for msg in relevant_messages:
+                            self._dispatch(msg, recv_ns)
             finally:
                 heartbeat_task.cancel()
                 rotation_task.cancel()
