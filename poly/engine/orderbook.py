@@ -97,6 +97,10 @@ class OrderBookEngine:
         """Drop local state for an asset that is no longer subscribed."""
         self._books.pop(asset_id, None)
 
+    def clear(self) -> None:
+        """Drop all local order book state after a websocket reconnect."""
+        self._books.clear()
+
     def top_n(self, asset_id: str, n: int = 10) -> tuple[list, list] | None:
         book = self._books.get(asset_id)
         if book is None:

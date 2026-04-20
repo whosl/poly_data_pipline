@@ -149,6 +149,7 @@ class UpDownCollector:
     async def _ws_loop(self) -> None:
         """Connect, manage subscriptions, and process messages."""
         url = self.config.poly_market_ws_url
+        self._reset_subscription_state("new_ws_connection")
         logger.info(
             "updown_ws_connecting",
             url=url,
@@ -197,6 +198,20 @@ class UpDownCollector:
                 heartbeat_task.cancel()
                 rotation_task.cancel()
                 self._ws = None
+
+    def _reset_subscription_state(self, reason: str) -> None:
+        """Clear per-connection subscription state before opening a new WS."""
+        assets = len(self._subscribed_assets)
+        slugs = len(self._slug_assets)
+        self._subscribed_assets.clear()
+        self._asset_metadata.clear()
+        self._slug_assets.clear()
+        self._slug_expiry_ts.clear()
+        self._known_slugs.clear()
+        if self.engine is not None:
+            self.engine.clear()
+        if assets or slugs:
+            logger.info("updown_subscription_state_reset", reason=reason, assets=assets, slugs=slugs)
 
     async def _rotation_loop(self) -> None:
         """Periodically check for new markets to subscribe and expired ones to drop."""
@@ -294,7 +309,8 @@ class UpDownCollector:
         for asset_id in expired_assets:
             self._subscribed_assets.pop(asset_id, None)
             self._asset_metadata.pop(asset_id, None)
-            self.engine.remove(asset_id)
+            if self.engine is not None:
+                self.engine.remove(asset_id)
         for slug in expired_slugs:
             self._slug_assets.pop(slug, None)
             self._slug_expiry_ts.pop(slug, None)
