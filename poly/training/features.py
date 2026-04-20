@@ -361,15 +361,21 @@ def add_lob_features(samples: pl.DataFrame) -> pl.DataFrame:
             df = df.with_columns(pl.lit(None).alias(col))
     df = df.with_columns(
         [
-            pl.col("top1_imbalance").alias("top3_imbalance"),
-            pl.col("top1_imbalance").alias("top5_imbalance"),
-            pl.col("top1_imbalance").alias("top10_imbalance"),
-            pl.col("total_bid_levels").cast(pl.Float64).alias("cum_bid_depth_topN_proxy"),
-            pl.col("total_ask_levels").cast(pl.Float64).alias("cum_ask_depth_topN_proxy"),
-            (pl.col("total_bid_levels").cast(pl.Float64) - pl.col("total_ask_levels").cast(pl.Float64))
-            .alias("depth_level_imbalance_proxy"),
-            pl.lit(None, dtype=pl.Float64).alias("bid_depth_slope"),
-            pl.lit(None, dtype=pl.Float64).alias("ask_depth_slope"),
+            # Use real top-N imbalance from depth features when available;
+            # fall back to top1 proxy for old data that lacks depth columns.
+            pl.coalesce([pl.col("depth_top3_imbalance"), pl.col("top1_imbalance")]).alias("top3_imbalance"),
+            pl.coalesce([pl.col("depth_top5_imbalance"), pl.col("top1_imbalance")]).alias("top5_imbalance"),
+            pl.coalesce([pl.col("depth_top10_imbalance"), pl.col("top1_imbalance")]).alias("top10_imbalance"),
+            # Use real cumulative depth when available; fall back to level-count proxy.
+            pl.coalesce([pl.col("cum_bid_depth_top10"), pl.col("total_bid_levels").cast(pl.Float64)]).alias("cum_bid_depth_topN_proxy"),
+            pl.coalesce([pl.col("cum_ask_depth_top10"), pl.col("total_ask_levels").cast(pl.Float64)]).alias("cum_ask_depth_topN_proxy"),
+            pl.coalesce(
+                [pl.col("depth_top10_imbalance"),
+                 (pl.col("total_bid_levels").cast(pl.Float64) - pl.col("total_ask_levels").cast(pl.Float64))]
+            ).alias("depth_level_imbalance_proxy"),
+            # Use real depth slope when available; fall back to None.
+            pl.coalesce([pl.col("bid_depth_slope_top10"), pl.lit(None, dtype=pl.Float64)]).alias("bid_depth_slope"),
+            pl.coalesce([pl.col("ask_depth_slope_top10"), pl.lit(None, dtype=pl.Float64)]).alias("ask_depth_slope"),
             pl.lit(None, dtype=pl.Float64).alias("queue_depletion_proxy"),
         ]
     )

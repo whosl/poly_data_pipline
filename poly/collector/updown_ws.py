@@ -409,7 +409,8 @@ class UpDownCollector:
     @staticmethod
     def _book_row(features: dict, recv_ns: int, exchange_ts: int,
                   market: str = "", slug: str = "", metadata: dict[str, object] | None = None) -> dict:
-        row = {
+        from poly.engine.orderbook import extract_depth_features
+        row: dict = {
             "source": f"polymarket:{slug}" if slug else "polymarket",
             "asset_id": str(features.get("asset_id", "")),
             "market": market,
@@ -424,6 +425,7 @@ class UpDownCollector:
             "total_bid_levels": int(features.get("total_bid_levels") or 0),
             "total_ask_levels": int(features.get("total_ask_levels") or 0),
         }
+        row.update(extract_depth_features(features))
         row.update(UpDownCollector._metadata_fields(metadata, slug))
         return row
 

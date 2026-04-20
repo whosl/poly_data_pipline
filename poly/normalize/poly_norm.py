@@ -134,7 +134,8 @@ class PolyNormalizer:
 
     @staticmethod
     def _book_features(features: dict, recv_ns: int, exchange_ts: int, market: str = "") -> dict:
-        return {
+        from poly.engine.orderbook import extract_depth_features
+        row: dict = {
             "source": "polymarket",
             "asset_id": str(features.get("asset_id", "")),
             "market": market,
@@ -149,6 +150,8 @@ class PolyNormalizer:
             "total_bid_levels": int(features.get("total_bid_levels") or 0),
             "total_ask_levels": int(features.get("total_ask_levels") or 0),
         }
+        row.update(extract_depth_features(features))
+        return row
 
     @staticmethod
     def _enrich(frame: pl.DataFrame, data_dir: Path, date: str) -> pl.DataFrame:

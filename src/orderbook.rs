@@ -187,7 +187,7 @@ impl OrderBook {
     /// Returns a Python dict with all computed features.
     pub fn depth_summary(&self) -> PyResult<PyObject> {
         Python::with_gil(|py| {
-            let mut dict = pyo3::types::PyDict::new(py);
+            let dict = pyo3::types::PyDict::new(py);
 
             let bb = self.bids.iter().next();
             let ba = self.asks.iter().next();
@@ -232,6 +232,59 @@ impl OrderBook {
             dict.set_item("total_ask_levels", self.asks.len())?;
             dict.set_item("last_exchange_ts", self.last_exchange_ts)?;
             dict.set_item("asset_id", self.asset_id.as_str())?;
+
+            // --- Top-N depth features ---
+            for &n in &[1usize, 3, 5, 10, 20] {
+                let bid_size: Decimal = self.bids.iter().take(n).map(|(_, s)| *s).sum();
+                let ask_size: Decimal = self.asks.iter().take(n).map(|(_, s)| *s).sum();
+                let total = bid_size + ask_size;
+                if total > Decimal::ZERO {
+                    let imb = (bid_size - ask_size) / total;
+                    dict.set_item(format!("depth_top{n}_imbalance"), imb.to_string())?;
+                } else {
+                    dict.set_item(format!("depth_top{n}_imbalance"), py.None())?;
+                }
+                dict.set_item(format!("cum_bid_depth_top{n}"), bid_size.to_string())?;
+                dict.set_item(format!("cum_ask_depth_top{n}"), ask_size.to_string())?;
+            }
+
+            // Depth slope for top 10 and 20
+            for &n in &[10usize, 20] {
+                let bid_sizes: Vec<Decimal> = self.bids.iter().take(n).map(|(_, s)| *s).collect();
+                let ask_sizes: Vec<Decimal> = self.asks.iter().take(n).map(|(_, s)| *s).collect();
+                if bid_sizes.len() >= 2 {
+                    let slope = (bid_sizes[bid_sizes.len() - 1] - bid_sizes[0])
+                        / Decimal::from(bid_sizes.len() - 1);
+                    dict.set_item(format!("bid_depth_slope_top{n}"), slope.to_string())?;
+                } else {
+                    dict.set_item(format!("bid_depth_slope_top{n}"), py.None())?;
+                }
+                if ask_sizes.len() >= 2 {
+                    let slope = (ask_sizes[ask_sizes.len() - 1] - ask_sizes[0])
+                        / Decimal::from(ask_sizes.len() - 1);
+                    dict.set_item(format!("ask_depth_slope_top{n}"), slope.to_string())?;
+                } else {
+                    dict.set_item(format!("ask_depth_slope_top{n}"), py.None())?;
+                }
+            }
+
+            // Near-touch notional for top 5, 10, 20
+            for &n in &[5usize, 10, 20] {
+                let bid_notional: Decimal = self
+                    .bids
+                    .iter()
+                    .take(n)
+                    .map(|(p, s)| p.0 * *s)
+                    .sum();
+                let ask_notional: Decimal = self
+                    .asks
+                    .iter()
+                    .take(n)
+                    .map(|(p, s)| *p * *s)
+                    .sum();
+                dict.set_item(format!("near_touch_bid_notional_{n}"), bid_notional.to_string())?;
+                dict.set_item(format!("near_touch_ask_notional_{n}"), ask_notional.to_string())?;
+            }
 
             Ok(dict.into())
         })
