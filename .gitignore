@@ -10,3 +10,5 @@ build/
 .env
 artifacts/
 .DS_Store
+docs/private/
+*.pem

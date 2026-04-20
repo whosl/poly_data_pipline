@@ -1,0 +1,463 @@
+# Agent Manual: poly_data_pipline / poly_trade_pipeline
+
+This is the handoff manual for a fresh coding agent with no chat history. It records the user requests already handled, the current training objective, implemented code paths, experiment results, operational context, and the next most useful work.
+
+Repository:
+
+- GitHub: `git@github.com:whosl/poly_data_pipline.git`
+- Local workspace used in this thread: `/Users/wenzhuolin/dev/poly/poly_trade_pipeline`
+- Main branch: `master`
+- Current latest pushed commit at the time this manual was written: `d13926c Prune expired UpDown subscriptions`
+
+Do not treat this repo as a final strategy engine. It is currently a data collection, normalization, label generation, feature engineering, baseline training, and offline evaluation pipeline for Polymarket short-horizon microstructure research.
+
+## User Goal
+
+The user's goal is to determine whether the collected Polymarket BTC/ETH Up/Down data contains a stable 5s/10s tradable edge.
+
+The model should not predict final market resolution. The current target strategy is a two-leg round trip:
+
+1. First leg: buy the chosen outcome using taker liquidity at or near current `best_ask`.
+2. Second leg: buy the opposite outcome as maker within a short horizon.
+3. Entry is attractive when `first_leg_ask + future_opposite_maker_fill_price <= 0.96`.
+
+The `0.96` threshold is a simplified cost/edge rule: the two bought outcomes should leave about `0.04` gross edge versus the `1.00` payoff identity, with room for fee, slippage, and safety margin.
+
+Current simplified `final_profit_10s` definition:
+
+- Success: `+0.02`
+- Failure: `-first_unwind_loss_proxy_10s`
+- `first_unwind_loss_proxy_10s = max(first_leg_ask - future_best_bid_10s, 0)`
+
+Important interpretation:
+
+- `p_enter` is the model output of interest.
+- `success` means the two-leg condition was achieved within the horizon, not that Polymarket eventually resolved in that direction.
+- `future_best_bid_10s` is same-leg future bid, used only for failure/unwind label construction. It must not be used as a feature.
+
+## Work Already Done
+
+The user asked for the following major tasks, and they have been handled in this thread:
+
+1. Clone and set up the repository.
+   - The repo `git@github.com:whosl/poly_data_pipline.git` was cloned into the working folder.
+   - Environment setup followed README instructions.
+   - Dependencies were installed in `.venv`.
+   - Rust extension was built so `poly_core` works.
+
+2. Inspect data size and data layout.
+   - The repo writes raw gzip JSONL, normalized parquet, and research/label parquet.
+   - The data directory has been repeatedly inspected as the user replaced and resynced data.
+
+3. Build the first training pipeline.
+   - Implemented reusable training modules under `poly/training`.
+   - Added scripts:
+     - `scripts/build_features.py`
+     - `scripts/build_labels.py`
+     - `scripts/train_alpha_model.py`
+     - `scripts/evaluate_alpha_model.py`
+     - `scripts/select_entry_cutoffs.py`
+   - Added chronological splitting, optional purge/embargo, and validation-selected entry cutoff evaluation.
+   - Baseline models include logistic regression, SGD logistic, GaussianNB, RandomForest, ExtraTrees, LightGBM, and XGBoost when installed.
+
+4. Document the training target and features.
+   - `README.md` now explains the two-leg objective, the current labels, feature list, and recommended commands.
+   - `docs/training_agent_guide.md` contains a deeper coding-agent handoff for training work.
+   - This `docs/agent_manual.doc` is the compact overall operational manual and work log.
+
+5. Add XGBoost support and run classifier-only experiments.
+   - XGBoost was installed and integrated as `xgboost_classifier`.
+   - Regressors were de-emphasized at the user's request.
+   - Current priority is classifier evaluation for `y_final_profit_entry_10s`.
+
+6. Build BTC-only / ETH-only / cross-symbol experiments.
+   - Supported experiment modes:
+     - BTC-only train/test
+     - ETH-only train/test
+     - train BTC, test ETH
+     - train ETH, test BTC
+     - mixed BTC+ETH
+   - Earlier strict experiment best candidate on `20260417` was BTC-only RandomForest:
+     - `p_enter >= 0.74`
+     - test entries: 60
+     - average `final_profit_10s`: about `+0.01117`
+     - success rate: about `78.33%`
+   - Mixed RandomForest was a backup:
+     - `p_enter >= 0.73`
+     - test entries: 82
+     - average `final_profit_10s`: about `+0.00780`
+     - success rate: about `73.17%`
+
+7. Explain and correct threshold selection.
+   - The user asked what it means to use validation set to choose `p_enter` cutoff instead of using test top-K.
+   - Plain meaning: pick the threshold on validation, freeze it, then test once. Do not look at test results to reverse-engineer a threshold.
+   - This is now the recommended strict evaluation workflow.
+
+8. Explain `bps`.
+   - `bps` means basis points.
+   - `1 bp = 0.01%`.
+   - In this repo, `markout_10s_bps` expresses short-horizon price movement/edge in basis points.
+
+9. Reframe the target from raw markout to two-leg entry profitability.
+   - The user initially asked whether target should be like `markout_10s > 0.04`.
+   - It was reframed to the more strategy-relevant condition:
+     - `first_leg_ask + future_opposite_maker_fill_price <= 0.96`
+   - The main label became `y_final_profit_entry_10s`, derived from two-leg success/failure and unwind loss.
+
+10. Analyze top-K prediction.
+   - Top-K was explained as a way to rank samples by model confidence and inspect the highest-confidence entries.
+   - It is useful diagnostically but should not be used to choose the final test threshold.
+
+11. Investigate Binance reference feature usage.
+   - Before depth fixes, Binance contributed about 10 features out of 41:
+     - `binance_mid`
+     - `binance_spread`
+     - `binance_return_tick`
+     - `binance_return_100ms`
+     - `binance_return_500ms`
+     - `binance_return_1s`
+     - `binance_return_3s`
+     - `binance_recent_trade_imbalance`
+     - `lead_lag_binance_minus_poly_1s`
+     - `lead_lag_binance_minus_poly_500ms`
+   - These were mostly from bookTicker and aggTrade.
+   - Coverage was near 99.9% for quote features and lower for trade imbalance.
+   - Caveat: older mixed ETH rows were using BTCUSDT reference because only BTCUSDT was available.
+
+12. Investigate `btcusdt@depth20@100ms`.
+   - The Binance API was fine; it returned full `bids` and `asks` arrays.
+   - The original collector/normalizer threw away core depth size information and only kept best bid/ask, spread, midpoint, and level counts.
+   - This was a pipeline issue, not a Binance data issue.
+
+13. Add Binance depth feature extraction.
+   - Commit: `d6af588 Add Binance depth feature extraction`
+   - Added `poly/collector/binance_depth.py`.
+   - Added depth features:
+     - top1/top3/top5/top10/top20 imbalance
+     - cumulative bid/ask depth top1/top3/top5/top10/top20
+     - bid/ask depth slope top10/top20
+     - near-touch bid/ask notional at 5/10/20
+   - Extended normalized schema.
+   - Training feature builder can now ingest these Binance depth features.
+
+14. Change Binance depth collection to compact raw.
+   - Commit: `1294526 Compact Binance depth raw collection`
+   - Collector still subscribes `depth20@100ms`.
+   - It computes compact depth features at collection time.
+   - It no longer saves raw `bids`/`asks` arrays for depth messages.
+   - It writes a compact raw envelope with `compact_depth_features=True`.
+   - Normalizer supports both old raw depth with `bids`/`asks` and new compact depth envelopes.
+   - `RawWriter.write_obj` was added so Binance collector does not parse JSON twice.
+
+15. Recover corrupted raw data.
+   - Added gzip recovery logic so damaged gzip members do not stop all processing.
+   - Recovered `20260417` and `20260418` Binance depth artifacts where possible.
+   - `20260417` recoverable depth20:
+     - 15,658 rows
+     - about 26.6 minutes
+     - artifact: `artifacts/depth20_recovered/20260417/binance_depth20_features.parquet`
+   - `20260418` recoverable depth20:
+     - 79,194 rows
+     - about 161 minutes
+     - artifact: `artifacts/depth20_recovered/20260418/binance_depth20_features.parquet`
+   - `20260418` Polymarket normalized/research was not usable for full supervised training at that time.
+
+16. Run Binance depth top-N experiments.
+   - First top10-ish depth experiment:
+     - dataset: `artifacts/depth20_experiment_20260417/btc_overlap_depth/alpha_dataset.parquet`
+     - rows: 55,599
+     - training features: 57
+     - Binance depth features: 16
+     - best model: LightGBM
+     - `p_enter >= 0.71`
+     - validation entries: 105
+     - validation avg finalProfit: `+0.003524`
+     - test entries: 104
+     - test avg finalProfit: `+0.013942`
+     - test total finalProfit: `+1.45`
+     - test success rate: `76.92%`
+   - Later full top10 experiment:
+     - dataset: `artifacts/depth_topn_experiment_20260417/btc_top10/alpha_dataset.parquet`
+     - rows: 55,599
+     - training features: 59
+     - Binance depth features: 18
+     - best model: LightGBM
+     - `p_enter >= 0.75`
+     - validation entries: 180
+     - validation avg finalProfit: `-0.003500`
+     - test entries: 248
+     - test avg finalProfit: `-0.007419`
+     - test total finalProfit: `-1.84`
+     - test success rate: `58.87%`
+   - Full top20 experiment:
+     - dataset: `artifacts/depth_topn_experiment_20260417/btc_top20/alpha_dataset.parquet`
+     - rows: 55,599
+     - training features: 66
+     - Binance depth features: 25
+     - best-ish result: RandomForest around `p_enter >= 0.68`
+     - test entries: 423
+     - test avg finalProfit: about `-0.00286`
+     - success rate: about `65.01%`
+   - Conclusion: depth features are used by models and likely contain signal, but the limited recovered slice does not prove stable profitability. Do not delete depth yet; collect more compact depth data.
+
+17. Evaluate Lightsail/Tokyo CPU pressure.
+   - The user collects data on a Tokyo Lightsail instance.
+   - The main CPU consumer was `python -m poly.main collect --symbols btcusdt`.
+   - Binance compact depth was not the main CPU issue after compaction.
+   - Polymarket `poly_l2_book` volume was the main driver.
+
+18. Make Polymarket collection BTC-only by default.
+   - Commit: `24f3185 Default Polymarket updown markets to BTC only`
+   - Added `POLY_UPDOWN_MARKETS`.
+   - Default:
+     - `btc-updown-5m,btc-updown-15m`
+   - Optional full BTC+ETH:
+     - `btc-updown-5m,btc-updown-15m,eth-updown-5m,eth-updown-15m`
+   - This reduces Polymarket L2 load.
+
+19. Hotfix unbounded UpDown subscription growth.
+   - Commit: `d13926c Prune expired UpDown subscriptions`
+   - Problem observed on Tokyo:
+     - `updown_subscribed total_assets` kept increasing.
+     - BTC-only should not keep dozens of active assets.
+   - Fix:
+     - track slug expiry
+     - unsubscribe expired assets
+     - prune local `_subscribed_assets`
+     - prune metadata maps
+     - remove `OrderBookEngine` state
+     - ignore messages for assets no longer subscribed
+     - write Polymarket raw only after message relevance filtering
+   - Verified on Tokyo:
+     - startup `total_assets=6`
+     - after one 5m expiration, log showed `updown_pruned_expired assets=2 slugs=1 total_assets=4`
+
+20. Investigate PMXT.
+   - The user asked to inspect `https://www.pmxt.dev/docs/introduction`.
+   - PMXT was considered as a possible external Polymarket data source.
+   - A few data fetches were attempted earlier in the thread.
+   - Keep future work cautious: verify data license, coverage, schema, latency, and whether it includes order book/trade fields useful for second-leg fill labels before integrating.
+
+## Current Collection Behavior
+
+Default collection command:
+
+```bash
+source .venv/bin/activate
+source $HOME/.cargo/env
+python -m poly.main collect --symbols btcusdt
+```
+
+Default Polymarket markets:
+
+```bash
+POLY_UPDOWN_MARKETS="btc-updown-5m,btc-updown-15m"
+```
+
+Default Binance streams currently include:
+
+- `btcusdt@bookTicker`
+- `btcusdt@aggTrade`
+- `btcusdt@depth20@100ms`
+
+Depth stream behavior after `1294526`:
+
+- Collect depth20 compact features.
+- Do not save raw `bids`/`asks` arrays for depth messages.
+- Continue writing normalized `binance_l2_book.parquet`.
+- New compact raw envelopes remain normalizable.
+
+## Current Feature Groups
+
+See `README.md` and `docs/training_agent_guide.md` for the canonical list. Main groups:
+
+1. Polymarket top of book and price.
+2. Polymarket imbalance/depth proxies.
+3. Polymarket book event activity.
+4. Polymarket trade flow.
+5. Binance reference returns and lead-lag features.
+6. Binance compact depth features when available.
+7. Regime and market metadata buckets.
+
+Strict rule: no future labels in feature columns. Exclude:
+
+- `future_*`
+- `markout_*`
+- `two_leg_*`
+- `final_profit_*`
+- `y_*`
+- any derived realized edge label
+
+## Current Important Artifacts
+
+Strict two-leg baseline:
+
+- `artifacts/final_profit_bid_20260417_strict/cutoff_selection/validation_selected_cutoffs_test_results.csv`
+
+Depth experiments:
+
+- `artifacts/depth20_experiment_20260417/btc_overlap_depth/alpha_dataset.parquet`
+- `artifacts/depth20_experiment_20260417/cutoff_selection_min100/validation_selected_cutoffs_test_results.csv`
+- `artifacts/depth_topn_experiment_20260417/btc_top10/alpha_dataset.parquet`
+- `artifacts/depth_topn_experiment_20260417/btc_top20/alpha_dataset.parquet`
+- `artifacts/depth_topn_experiment_20260417/cutoff_selection_min100/validation_selected_cutoffs_test_results.csv`
+
+Recovered Binance depth:
+
+- `artifacts/depth20_recovered/20260417/binance_depth20_features.parquet`
+- `artifacts/depth20_recovered/20260418/binance_depth20_features.parquet`
+
+Note: `artifacts/` is gitignored and may not exist for every future agent.
+
+## Current Tokyo Runtime State
+
+Tokyo/Lightsail details are intentionally not stored in this tracked manual. See the gitignored private file:
+
+- `docs/private/tokyo_lightsail.md`
+
+Latest observed state after hotfix deploy:
+
+- Remote repo was pulled to `d13926c`.
+- `poly` tmux session was restarted.
+- New process:
+  - `python -m poly.main collect --symbols btcusdt`
+- Startup log:
+  - `markets=['btc-updown-5m', 'btc-updown-15m']`
+  - `updown_subscribed new_assets=6 total_assets=6`
+- Prune verified:
+  - `updown_pruned_expired assets=2 slugs=1 total_assets=4`
+- Resource after restart:
+  - collect CPU roughly mid tens of percent
+  - RSS about 178MB shortly after restart
+
+Remote repo had an unrelated local modification:
+
+- `poly/metadata/polymarket.py`
+
+Do not overwrite that file without inspecting it and asking if needed.
+
+## Operational Commands
+
+Local verification:
+
+```bash
+source .venv/bin/activate
+python -m compileall poly scripts
+git diff --check
+```
+
+Build labels/data:
+
+```bash
+python -m poly.main metadata 20260417
+python -m poly.main normalize 20260417 --source polymarket
+python -m poly.main normalize 20260417 --source binance
+python -m poly.main labels 20260417
+```
+
+Build features:
+
+```bash
+python scripts/build_features.py \
+  --data-dir data \
+  --dates 20260417 \
+  --output-dir artifacts/training \
+  --sample-interval-ms 100
+```
+
+Train strict entry classifier:
+
+```bash
+python scripts/train_alpha_model.py \
+  --dataset artifacts/training/alpha_dataset.parquet \
+  --output-dir artifacts/training/strict_models \
+  --target-reg final_profit_10s \
+  --target-cls y_final_profit_entry_10s \
+  --sample-weight-col final_profit_weight_10s \
+  --split-purge-ms 10000 \
+  --split-embargo-ms 10000
+```
+
+Select cutoff on validation:
+
+```bash
+python scripts/select_entry_cutoffs.py \
+  --output-dir artifacts/training/cutoff_selection \
+  --split-purge-ms 10000 \
+  --split-embargo-ms 10000 \
+  --target-profit final_profit_10s \
+  --target-cls y_final_profit_entry_10s \
+  --run btc_only artifacts/training/btc_only/alpha_dataset.parquet artifacts/training/btc_only/alpha_dataset.parquet artifacts/training/btc_only/strict_models
+```
+
+## Current Known Issues
+
+1. Depth experiments are based on a small recovered 20260417 overlap slice.
+   - Do not overfit conclusions to those results.
+   - Need full fresh days after compact depth collection.
+
+2. Layer 3 maker fill labels are not final.
+   - Current labels use observed future trade/book evidence.
+   - Still need conservative queue-position replay for production-level fill probability.
+
+3. Mixed BTC/ETH experiments can be misleading unless ETH has correct ETH Binance reference.
+   - Older data often only had BTCUSDT reference.
+
+4. Polymarket true top-N depth is still limited.
+   - Normalized Polymarket L2 currently has top-of-book/depth summaries, not full per-level true top-N feature columns.
+
+5. Raw data can be corrupted if a process is killed mid-gzip member.
+   - Recovery code helps, but collection should be stopped gracefully.
+
+6. Tokyo has no swap.
+   - Keep memory growth under observation.
+   - The UpDown prune hotfix should reduce long-run growth.
+
+## Next Best Tasks
+
+1. Let Tokyo collect a longer fresh BTC-only compact-depth dataset.
+2. Pull that data locally or run feature building on the instance.
+3. Rebuild normalized/research/features for full fresh days.
+4. Rerun strict validation-selected cutoff tests:
+   - BTC-only
+   - ETH-only only if ETH reference is correct
+   - mixed only if reference mapping is correct
+5. Compare:
+   - no Binance depth
+   - top10 depth
+   - top20 depth
+6. Revisit whether `depth20@100ms` is worth keeping versus `depth10@100ms` only after full-day experiments.
+7. Improve second-leg maker fill labels with queue-aware replay.
+8. Watch Tokyo `poly` tmux logs for:
+   - `updown_pruned_expired`
+   - bounded `total_assets`
+   - stable RSS
+
+## Commit History Landmarks
+
+Useful recent commits:
+
+- `d13926c Prune expired UpDown subscriptions`
+- `24f3185 Default Polymarket updown markets to BTC only`
+- `1294526 Compact Binance depth raw collection`
+- `d6af588 Add Binance depth feature extraction`
+- `4a50269 Add two-leg entry training pipeline`
+- `c12df9d Enable XGBoost classifier label encoding`
+- `bb9520f Handle categorical bucket features in training`
+- `d9ca66e Add Polymarket metadata enrichment`
+- `86c38eb Document training pipeline for coding agents`
+- `b136997 Join single-symbol Binance features by timestamp`
+- `83898b6 Exclude realized entry edge from training features`
+- `57a6fb5 Recover truncated gzip raw feeds`
+
+## Style For Future Agents
+
+When changing this repo:
+
+- Prefer small, verifiable commits.
+- Preserve user or remote uncommitted changes.
+- Never reset or checkout away unknown edits.
+- Use chronological splits only.
+- Treat test set as sacred.
+- Report trading usefulness metrics, not only generic ML scores.
+- For Tokyo operations, use the private ignored doc and avoid printing secrets.
