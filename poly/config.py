@@ -18,6 +18,7 @@ class Config:
     poly_user_ws_url: str
     binance_ws_url: str
     binance_symbols: list[str]
+    updown_markets: list[str]
     api_key: str
     api_secret: str
     api_passphrase: str
@@ -33,6 +34,7 @@ def get_config() -> Config:
     """Load config from environment variables with sensible defaults."""
     data_dir = Path(os.environ.get("POLY_DATA_DIR", str(_PROJECT_ROOT / "data")))
     symbols_str = os.environ.get("POLY_BINANCE_SYMBOLS", "btcusdt")
+    updown_markets_str = os.environ.get("POLY_UPDOWN_MARKETS", "btc-updown-5m,btc-updown-15m")
     tags_str = os.environ.get("POLY_FILTER_TAGS", "bitcoin,crypto")
 
     return Config(
@@ -51,6 +53,7 @@ def get_config() -> Config:
             "POLY_BINANCE_WS_URL", "wss://stream.binance.com:9443"
         ),
         binance_symbols=[s.strip().lower() for s in symbols_str.split(",")],
+        updown_markets=[s.strip().lower() for s in updown_markets_str.split(",") if s.strip()],
         api_key=os.environ.get("POLY_API_KEY", ""),
         api_secret=os.environ.get("POLY_API_SECRET", ""),
         api_passphrase=os.environ.get("POLY_API_PASSPHRASE", ""),

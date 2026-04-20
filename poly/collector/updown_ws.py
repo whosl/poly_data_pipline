@@ -1,6 +1,7 @@
 """Up/Down market collector with auto-rotation.
 
-Tracks btc-updown-5m, btc-updown-15m, eth-updown-5m, eth-updown-15m markets.
+By default this tracks btc-updown-5m and btc-updown-15m markets. Set
+POLY_UPDOWN_MARKETS to override the list, for example to include ETH.
 Automatically subscribes to upcoming markets and rotates when they expire.
 """
 
@@ -23,12 +24,16 @@ from poly.metadata.polymarket import market_to_asset_rows
 
 logger = structlog.get_logger()
 
-# Market definitions: (base_slug, period_seconds, subscribe_ahead_seconds)
-MARKET_DEFS = [
+# Market definitions: base_slug -> (base_slug, period_seconds, subscribe_ahead_seconds)
+SUPPORTED_MARKET_DEFS = {
+    "btc-updown-5m": ("btc-updown-5m", 300, 60),   # 5-min BTC, subscribe 60s early
+    "btc-updown-15m": ("btc-updown-15m", 900, 120),  # 15-min BTC, subscribe 120s early
+    "eth-updown-5m": ("eth-updown-5m", 300, 60),
+    "eth-updown-15m": ("eth-updown-15m", 900, 120),
+}
+DEFAULT_MARKET_DEFS = [
     ("btc-updown-5m",  300, 60),   # 5-min BTC, subscribe 60s early
     ("btc-updown-15m", 900, 120),  # 15-min BTC, subscribe 120s early
-    ("eth-updown-5m",  300, 60),
-    ("eth-updown-15m", 900, 120),
 ]
 
 
@@ -46,6 +51,27 @@ def _upcoming_timestamps(period: int, ahead: int, now: int) -> list[int]:
         result.append(t)
         t += period
     return result
+
+
+def _market_defs_from_config(config: Config) -> list[tuple[str, int, int]]:
+    market_defs: list[tuple[str, int, int]] = []
+    for market in config.updown_markets:
+        market_def = SUPPORTED_MARKET_DEFS.get(market)
+        if market_def is None:
+            logger.warning(
+                "unsupported_updown_market",
+                market=market,
+                supported=sorted(SUPPORTED_MARKET_DEFS),
+            )
+            continue
+        market_defs.append(market_def)
+    if not market_defs:
+        logger.warning(
+            "no_supported_updown_markets_configured",
+            fallback=[m[0] for m in DEFAULT_MARKET_DEFS],
+        )
+        return DEFAULT_MARKET_DEFS
+    return market_defs
 
 
 async def fetch_market_tokens(session: aiohttp.ClientSession, slug: str) -> dict | None:
@@ -100,6 +126,7 @@ class UpDownCollector:
         self._asset_metadata: dict[str, dict[str, object]] = {}
         self._known_slugs: set[str] = set()
         self._msg_count = 0
+        self._market_defs = _market_defs_from_config(config)
 
     async def run(self) -> None:
         """Main loop: manage subscriptions and WebSocket connection."""
@@ -116,7 +143,11 @@ class UpDownCollector:
     async def _ws_loop(self) -> None:
         """Connect, manage subscriptions, and process messages."""
         url = self.config.poly_market_ws_url
-        logger.info("updown_ws_connecting", url=url)
+        logger.info(
+            "updown_ws_connecting",
+            url=url,
+            markets=[m[0] for m in self._market_defs],
+        )
 
         async with websockets.connect(url, ping_interval=None) as ws:
             self._ws = ws
@@ -169,7 +200,7 @@ class UpDownCollector:
         now = int(time.time())
         new_slugs: list[str] = []
 
-        for base_slug, period, ahead in MARKET_DEFS:
+        for base_slug, period, ahead in self._market_defs:
             timestamps = _upcoming_timestamps(period, ahead, now)
             for ts in timestamps:
                 slug = f"{base_slug}-{ts}"

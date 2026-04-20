@@ -64,7 +64,7 @@ async def _run_collectors(tags_str: str, symbols_str: str) -> None:
 
     engine = OrderBookEngine()
 
-    # UpDown collector: btc/eth updown-5m + updown-15m with auto-rotation
+    # UpDown collector: configured 5m/15m markets with auto-rotation
     updown_collector = UpDownCollector(
         config, poly_raw, poly_book_w, poly_trade_w, poly_bba_w, engine
     )

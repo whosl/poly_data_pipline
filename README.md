@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **Polymarket Up/Down 市场采集**：自动发现、订阅、轮换 btc/eth updown-5m/15m 市场
+- **Polymarket Up/Down 市场采集**：默认自动发现、订阅、轮换 BTC updown-5m/15m 市场，可用 `POLY_UPDOWN_MARKETS` 打开 ETH
 - Polymarket 实时 L2 订单簿 + 成交采集（Market WebSocket）
 - Polymarket 自有订单/成交回报（User WebSocket，需认证）
 - Binance BTC/ETH 参考行情（bookTicker / aggTrade / depth20）
@@ -61,6 +61,7 @@ export POLY_API_PASSPHRASE=""
 # 可选
 export POLY_DATA_DIR="./data"                    # 数据存储目录
 export POLY_BINANCE_SYMBOLS="btcusdt"            # Binance 交易对
+export POLY_UPDOWN_MARKETS="btc-updown-5m,btc-updown-15m"  # Polymarket Up/Down 市场；默认 BTC 5m/15m
 export POLY_WATCHDOG_TIMEOUT="120"               # 静默冻结检测超时（秒）
 export POLY_RAW_FLUSH_INTERVAL="5"               # 原始数据 flush 间隔（秒）
 ```
@@ -77,7 +78,7 @@ python -m poly.main collect --symbols btcusdt
 ```
 
 采集器启动后：
-1. 自动计算 btc/eth updown-5m/15m 当前和下一期市场 slug（如 `btc-updown-5m-1776409800`）
+1. 自动计算 `POLY_UPDOWN_MARKETS` 配置的当前和下一期市场 slug（默认 `btc-updown-5m` / `btc-updown-15m`，如 `btc-updown-5m-1776409800`）
 2. 通过 Gamma API 查询市场 token IDs
 3. 连接 Polymarket market WebSocket，订阅订单簿和成交
 4. 每 10 秒检查是否有新市场需要订阅
@@ -87,12 +88,18 @@ python -m poly.main collect --symbols btcusdt
 
 #### 采集的市场
 
+默认只采 BTC 5m/15m，以降低 Polymarket L2 book 的 CPU 和落盘压力。需要恢复 ETH 时可设置：
+
+```bash
+export POLY_UPDOWN_MARKETS="btc-updown-5m,btc-updown-15m,eth-updown-5m,eth-updown-15m"
+```
+
 | 市场类型 | 周期 | 提前订阅 |
 |---------|------|---------|
 | btc-updown-5m | 5 分钟 | 60 秒 |
 | btc-updown-15m | 15 分钟 | 120 秒 |
-| eth-updown-5m | 5 分钟 | 60 秒 |
-| eth-updown-15m | 15 分钟 | 120 秒 |
+| eth-updown-5m | 5 分钟 | 60 秒，可选 |
+| eth-updown-15m | 15 分钟 | 120 秒，可选 |
 
 ### 标准化
 
