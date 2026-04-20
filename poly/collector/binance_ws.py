@@ -11,6 +11,7 @@ import aiohttp
 import websockets
 
 from poly.config import Config
+from poly.collector.binance_depth import depth_features
 from poly.storage.raw import RawWriter
 from poly.storage.normalized import ParquetWriter
 
@@ -125,7 +126,7 @@ class BinanceWS:
         # Extract symbol from stream name
         symbol = stream.split("@")[0]
 
-        self.book_writer.append({
+        row = {
             "source": "binance",
             "asset_id": symbol,
             "market": "",
@@ -139,7 +140,9 @@ class BinanceWS:
             "imbalance": None,
             "total_bid_levels": len(bids),
             "total_ask_levels": len(asks),
-        })
+        }
+        row.update(depth_features(bids, asks))
+        self.book_writer.append(row)
 
     async def _sync_clock(self) -> None:
         """Measure clock offset against Binance server time."""

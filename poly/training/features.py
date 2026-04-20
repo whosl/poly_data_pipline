@@ -26,6 +26,34 @@ logger = structlog.get_logger()
 NS_PER_MS = 1_000_000
 NS_PER_SECOND = 1_000_000_000
 EXPIRY_RE = re.compile(r"(?P<symbol>btc|eth)-updown-(?P<period>5m|15m)-(?P<expiry>\d+)", re.I)
+DEPTH_FEATURE_COLUMNS = [
+    "depth_top1_imbalance",
+    "depth_top3_imbalance",
+    "depth_top5_imbalance",
+    "depth_top10_imbalance",
+    "depth_top20_imbalance",
+    "cum_bid_depth_top1",
+    "cum_ask_depth_top1",
+    "cum_bid_depth_top3",
+    "cum_ask_depth_top3",
+    "cum_bid_depth_top5",
+    "cum_ask_depth_top5",
+    "cum_bid_depth_top10",
+    "cum_ask_depth_top10",
+    "cum_bid_depth_top20",
+    "cum_ask_depth_top20",
+    "bid_depth_slope_top10",
+    "ask_depth_slope_top10",
+    "bid_depth_slope_top20",
+    "ask_depth_slope_top20",
+    "near_touch_bid_notional_5",
+    "near_touch_ask_notional_5",
+    "near_touch_bid_notional_10",
+    "near_touch_ask_notional_10",
+    "near_touch_bid_notional_20",
+    "near_touch_ask_notional_20",
+]
+BINANCE_DEPTH_FEATURE_COLUMNS = [f"binance_{col}" for col in DEPTH_FEATURE_COLUMNS]
 
 
 @dataclass
@@ -176,6 +204,21 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
     for col in ["total_bid_levels", "total_ask_levels"]:
         if col not in df.columns:
             df = df.with_columns(pl.lit(None, dtype=pl.Int32).alias(col))
+    for col in DEPTH_FEATURE_COLUMNS:
+        if col not in df.columns:
+            df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias(col))
+    df = df.with_columns(
+        [
+            pl.when(pl.col("midpoint").is_null())
+            .then((pl.col("best_bid") + pl.col("best_ask")) / 2)
+            .otherwise(pl.col("midpoint"))
+            .alias("midpoint"),
+            pl.when(pl.col("spread").is_null())
+            .then(pl.col("best_ask") - pl.col("best_bid"))
+            .otherwise(pl.col("spread"))
+            .alias("spread"),
+        ]
+    )
 
     df = df.with_columns(
         [
@@ -196,6 +239,7 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
             pl.col("spread").cast(pl.Float64).alias("current_spread"),
             pl.col("microprice").cast(pl.Float64).alias("current_microprice"),
             pl.col("imbalance").cast(pl.Float64).alias("top1_imbalance"),
+            *[pl.col(col).cast(pl.Float64) for col in DEPTH_FEATURE_COLUMNS],
         ]
     )
     df = df.with_columns(
@@ -272,6 +316,7 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
         "top1_imbalance",
         "total_bid_levels",
         "total_ask_levels",
+        *DEPTH_FEATURE_COLUMNS,
         "imbalance_bucket",
         "spread_bucket",
         "price_bucket",
@@ -539,7 +584,7 @@ def canonicalize_binance_book(tables: dict[str, TableLoadResult]) -> pl.DataFram
     df = canonicalize_book(raw)
     if df.is_empty():
         return df
-    return df.select(
+    base = df.select(
         [
             "recv_ns",
             "asset_id",
@@ -557,6 +602,41 @@ def canonicalize_binance_book(tables: dict[str, TableLoadResult]) -> pl.DataFram
             "top1_imbalance": "binance_book_imbalance",
         }
     ).sort("recv_ns")
+
+    depth_raw = get_frame(tables, "binance_l2_book")
+    if depth_raw is None or depth_raw.is_empty():
+        return base.with_columns(empty_binance_depth_feature_exprs())
+    depth = canonicalize_book(depth_raw)
+    if depth.is_empty():
+        return base.with_columns(empty_binance_depth_feature_exprs())
+
+    depth_state = depth.select(["recv_ns", "symbol", *DEPTH_FEATURE_COLUMNS]).rename(
+        {
+            "symbol": "binance_symbol",
+            **{col: f"binance_{col}" for col in DEPTH_FEATURE_COLUMNS},
+        }
+    )
+    join_globally = depth_state["binance_symbol"].drop_nulls().n_unique() <= 1
+    depth_tolerance_ns = 2_000 * NS_PER_MS
+    if join_globally:
+        joined = base.sort("recv_ns").join_asof(
+            depth_state.drop(["binance_symbol"], strict=False).sort("recv_ns"),
+            on="recv_ns",
+            strategy="backward",
+            tolerance=depth_tolerance_ns,
+        )
+    else:
+        joined = join_asof_by_group(
+            base,
+            depth_state.rename({"binance_symbol": "symbol"}),
+            by=["symbol"],
+            tolerance_ms=2_000,
+        )
+    for expr in empty_binance_depth_feature_exprs():
+        name = expr.meta.output_name()
+        if name not in joined.columns:
+            joined = joined.with_columns(expr)
+    return joined.sort("recv_ns")
 
 
 def add_binance_features(
@@ -648,7 +728,12 @@ def empty_binance_feature_exprs() -> list[pl.Expr]:
         pl.lit(None, dtype=pl.Float64).alias("binance_return_500ms"),
         pl.lit(None, dtype=pl.Float64).alias("binance_return_1s"),
         pl.lit(None, dtype=pl.Float64).alias("binance_return_3s"),
+        *empty_binance_depth_feature_exprs(),
     ]
+
+
+def empty_binance_depth_feature_exprs() -> list[pl.Expr]:
+    return [pl.lit(None, dtype=pl.Float64).alias(col) for col in BINANCE_DEPTH_FEATURE_COLUMNS]
 
 
 def add_research_buckets(samples: pl.DataFrame, enriched: pl.DataFrame | None, tolerance_ms: int) -> pl.DataFrame:

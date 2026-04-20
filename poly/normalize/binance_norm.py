@@ -6,6 +6,7 @@ import structlog
 import orjson
 import polars as pl
 from pathlib import Path
+from poly.collector.binance_depth import depth_features
 from poly.storage.recover import iter_recovered_gzip_jsonl_lines
 
 logger = structlog.get_logger()
@@ -77,7 +78,7 @@ class BinanceNormalizer:
                 asks = data.get("asks", [])
                 if bids and asks:
                     symbol = stream.split("@")[0]
-                    book_rows.append({
+                    row = {
                         "source": "binance",
                         "asset_id": symbol,
                         "market": "",
@@ -91,7 +92,9 @@ class BinanceNormalizer:
                         "imbalance": None,
                         "total_bid_levels": len(bids),
                         "total_ask_levels": len(asks),
-                    })
+                    }
+                    row.update(depth_features(bids, asks))
+                    book_rows.append(row)
 
             count += 1
 
