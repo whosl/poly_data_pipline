@@ -5,11 +5,13 @@ from __future__ import annotations
 import structlog
 import orjson
 import polars as pl
+import re
 from pathlib import Path
 from poly.collector.binance_depth import depth_features
 from poly.storage.recover import iter_recovered_gzip_jsonl_lines
 
 logger = structlog.get_logger()
+DEPTH_STREAM_RE = re.compile(r"@depth(?P<levels>\d+)")
 
 
 class BinanceNormalizer:
@@ -78,6 +80,7 @@ class BinanceNormalizer:
                 asks = data.get("asks", [])
                 if bids and asks:
                     symbol = stream.split("@")[0]
+                    max_depth = depth_levels_from_stream(stream)
                     row = {
                         "source": "binance",
                         "asset_id": symbol,
@@ -93,8 +96,10 @@ class BinanceNormalizer:
                         "total_bid_levels": len(bids),
                         "total_ask_levels": len(asks),
                     }
-                    row.update(depth_features(bids, asks))
+                    row.update(depth_features(bids, asks, max_depth=max_depth))
                     book_rows.append(row)
+                elif data.get("compact_depth_features"):
+                    book_rows.append(compact_depth_row(data, recv_ns, stream))
 
             count += 1
 
@@ -111,3 +116,33 @@ class BinanceNormalizer:
             logger.info("binance_norm_book", rows=len(book_rows))
 
         logger.info("binance_norm_done", date=date, total_messages=count)
+
+
+def depth_levels_from_stream(stream: str) -> int:
+    match = DEPTH_STREAM_RE.search(stream)
+    if match:
+        return int(match.group("levels"))
+    return 20
+
+
+def compact_depth_row(data: dict, recv_ns: int, stream: str) -> dict:
+    symbol = data.get("asset_id") or stream.split("@")[0]
+    row = {
+        "source": "binance",
+        "asset_id": str(symbol).lower(),
+        "market": data.get("market", ""),
+        "recv_ns": recv_ns,
+        "exchange_ts": data.get("exchange_ts", 0),
+        "best_bid": data.get("best_bid"),
+        "best_ask": data.get("best_ask"),
+        "spread": data.get("spread"),
+        "midpoint": data.get("midpoint"),
+        "microprice": data.get("microprice"),
+        "imbalance": data.get("imbalance"),
+        "total_bid_levels": data.get("total_bid_levels"),
+        "total_ask_levels": data.get("total_ask_levels"),
+    }
+    for key, value in data.items():
+        if key.startswith(("depth_", "cum_", "bid_depth_", "ask_depth_", "near_touch_")):
+            row[key] = value
+    return row

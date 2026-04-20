@@ -38,9 +38,11 @@ class RawWriter:
         return d / f"{self.source}_{self.channel}.jsonl.gz"
 
     async def write(self, raw_json: bytes, recv_ns: int) -> None:
-        date_str = self._date_from_ns(recv_ns)
-        line = orjson.dumps({"recv_ns": recv_ns, "raw": orjson.loads(raw_json)})
+        await self.write_obj(orjson.loads(raw_json), recv_ns)
 
+    async def write_obj(self, raw_obj: object, recv_ns: int) -> None:
+        date_str = self._date_from_ns(recv_ns)
+        line = orjson.dumps({"recv_ns": recv_ns, "raw": raw_obj})
         async with self._lock:
             if date_str != self._current_date:
                 await self._rotate(date_str)

@@ -7,6 +7,7 @@ import time
 import structlog
 import orjson
 import aiohttp
+import re
 
 import websockets
 
@@ -16,6 +17,8 @@ from poly.storage.raw import RawWriter
 from poly.storage.normalized import ParquetWriter
 
 logger = structlog.get_logger()
+
+DEPTH_STREAM_RE = re.compile(r"@depth(?P<levels>\d+)")
 
 
 class BinanceWS:
@@ -70,8 +73,6 @@ class BinanceWS:
                     recv_ns = poly_core.now_ns()
                     self._msg_count += 1
 
-                    await self.raw_writer.write(message, recv_ns)
-
                     try:
                         envelope = orjson.loads(message)
                     except Exception:
@@ -83,11 +84,15 @@ class BinanceWS:
                         continue
 
                     if stream.endswith("@bookTicker"):
+                        await self.raw_writer.write_obj(envelope, recv_ns)
                         self._handle_book_ticker(data, recv_ns)
                     elif stream.endswith("@aggTrade"):
+                        await self.raw_writer.write_obj(envelope, recv_ns)
                         self._handle_agg_trade(data, recv_ns)
                     elif "@depth" in stream:
-                        self._handle_depth(data, recv_ns, stream)
+                        row = self._handle_depth(data, recv_ns, stream)
+                        if row is not None:
+                            await self.raw_writer.write_obj(compact_depth_envelope(stream, row), recv_ns)
         finally:
             clock_task.cancel()
 
@@ -117,14 +122,15 @@ class BinanceWS:
             "fee_rate_bps": 0.0,
         })
 
-    def _handle_depth(self, data: dict, recv_ns: int, stream: str) -> None:
+    def _handle_depth(self, data: dict, recv_ns: int, stream: str) -> dict | None:
         bids = data.get("bids", [])
         asks = data.get("asks", [])
         if not bids or not asks:
-            return
+            return None
 
         # Extract symbol from stream name
         symbol = stream.split("@")[0]
+        max_depth = depth_levels_from_stream(stream)
 
         row = {
             "source": "binance",
@@ -141,8 +147,9 @@ class BinanceWS:
             "total_bid_levels": len(bids),
             "total_ask_levels": len(asks),
         }
-        row.update(depth_features(bids, asks))
+        row.update(depth_features(bids, asks, max_depth=max_depth))
         self.book_writer.append(row)
+        return row
 
     async def _sync_clock(self) -> None:
         """Measure clock offset against Binance server time."""
@@ -165,3 +172,20 @@ class BinanceWS:
         while True:
             await asyncio.sleep(600)
             await self._sync_clock()
+
+
+def depth_levels_from_stream(stream: str) -> int:
+    match = DEPTH_STREAM_RE.search(stream)
+    if match:
+        return int(match.group("levels"))
+    return 20
+
+
+def compact_depth_envelope(stream: str, row: dict) -> dict:
+    data = {
+        key: value
+        for key, value in row.items()
+        if key not in {"source", "market", "recv_ns"}
+    }
+    data["compact_depth_features"] = True
+    return {"stream": stream, "data": data}

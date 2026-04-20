@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-def depth_features(bids: list, asks: list, max_depth: int = 10) -> dict[str, float | int | None]:
+def depth_features(bids: list, asks: list, max_depth: int = 20) -> dict[str, float | int | None]:
     bid_levels = parse_levels(bids, max_depth)
     ask_levels = parse_levels(asks, max_depth)
     if not bid_levels or not ask_levels:
