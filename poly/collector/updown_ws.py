@@ -24,6 +24,8 @@ from poly.metadata.polymarket import market_to_asset_rows
 
 logger = structlog.get_logger()
 
+EXPIRED_MARKET_GRACE_SECONDS = 5
+
 # Market definitions: base_slug -> (base_slug, period_seconds, subscribe_ahead_seconds)
 SUPPORTED_MARKET_DEFS = {
     "btc-updown-5m": ("btc-updown-5m", 300, 60),   # 5-min BTC, subscribe 60s early
@@ -124,6 +126,8 @@ class UpDownCollector:
         self._ws = None
         self._subscribed_assets: dict[str, str] = {}  # asset_id -> slug
         self._asset_metadata: dict[str, dict[str, object]] = {}
+        self._slug_assets: dict[str, set[str]] = {}
+        self._slug_expiry_ts: dict[str, int] = {}
         self._known_slugs: set[str] = set()
         self._msg_count = 0
         self._market_defs = _market_defs_from_config(config)
@@ -168,20 +172,23 @@ class UpDownCollector:
                     if not text or text in ("PONG", "PING"):
                         continue
 
-                    await self.raw_writer.write(message if isinstance(message, bytes) else message.encode(), recv_ns)
-
                     try:
                         parsed = orjson.loads(text)
                     except Exception:
                         continue
 
                     messages = parsed if isinstance(parsed, list) else [parsed]
-                    for msg in messages:
-                        if not isinstance(msg, dict):
-                            continue
-                        event_type = msg.get("event_type")
-                        if not event_type:
-                            continue
+                    relevant_messages = [
+                        msg
+                        for msg in messages
+                        if isinstance(msg, dict) and self._is_relevant_market_message(msg)
+                    ]
+                    if not relevant_messages:
+                        continue
+
+                    await self.raw_writer.write(message if isinstance(message, bytes) else message.encode(), recv_ns)
+
+                    for msg in relevant_messages:
                         self._dispatch(msg, recv_ns)
             finally:
                 heartbeat_task.cancel()
@@ -198,7 +205,9 @@ class UpDownCollector:
     async def _refresh_subscriptions(self, session: aiohttp.ClientSession) -> None:
         """Discover and subscribe to current + upcoming markets."""
         now = int(time.time())
+        await self._prune_expired_subscriptions(now)
         new_slugs: list[str] = []
+        new_slug_expiry_ts: dict[str, int] = {}
 
         for base_slug, period, ahead in self._market_defs:
             timestamps = _upcoming_timestamps(period, ahead, now)
@@ -209,6 +218,7 @@ class UpDownCollector:
                     continue  # already expired
                 if slug not in self._known_slugs:
                     new_slugs.append(slug)
+                    new_slug_expiry_ts[slug] = ts + period
 
         if not new_slugs:
             return
@@ -223,12 +233,15 @@ class UpDownCollector:
                 continue
 
             self._known_slugs.add(slug)
+            if slug in new_slug_expiry_ts:
+                self._slug_expiry_ts[slug] = new_slug_expiry_ts[slug]
             for row in info.get("metadata_rows", []):
                 asset_id = str(row.get("asset_id") or "")
                 if asset_id:
                     self._asset_metadata[asset_id] = row
             for tid in info["token_ids"]:
                 self._subscribed_assets[tid] = slug
+                self._slug_assets.setdefault(slug, set()).add(tid)
                 new_assets.append(tid)
 
             logger.info("updown_new_market",
@@ -250,6 +263,47 @@ class UpDownCollector:
         logger.info("updown_subscribed", new_assets=len(new_assets),
                    total_assets=len(self._subscribed_assets))
 
+    async def _prune_expired_subscriptions(self, now: int) -> None:
+        """Unsubscribe and drop local state for expired Up/Down markets."""
+        expired_slugs = [
+            slug
+            for slug, expiry_ts in self._slug_expiry_ts.items()
+            if expiry_ts + EXPIRED_MARKET_GRACE_SECONDS <= now
+        ]
+        if not expired_slugs:
+            return
+
+        expired_assets: list[str] = []
+        for slug in expired_slugs:
+            expired_assets.extend(sorted(self._slug_assets.get(slug, set())))
+
+        if expired_assets and self._ws is not None:
+            unsub_msg = orjson.dumps({
+                "assets_ids": expired_assets,
+                "operation": "unsubscribe",
+                "type": "market",
+            })
+            try:
+                await self._ws.send(unsub_msg)
+            except Exception as e:
+                logger.warning("updown_unsubscribe_failed", assets=len(expired_assets), error=str(e))
+
+        for asset_id in expired_assets:
+            self._subscribed_assets.pop(asset_id, None)
+            self._asset_metadata.pop(asset_id, None)
+            self.engine.remove(asset_id)
+        for slug in expired_slugs:
+            self._slug_assets.pop(slug, None)
+            self._slug_expiry_ts.pop(slug, None)
+            self._known_slugs.discard(slug)
+
+        logger.info(
+            "updown_pruned_expired",
+            slugs=len(expired_slugs),
+            assets=len(expired_assets),
+            total_assets=len(self._subscribed_assets),
+        )
+
     def _dispatch(self, msg: dict, recv_ns: int) -> None:
         event_type = msg.get("event_type")
         if event_type == "book":
@@ -261,8 +315,22 @@ class UpDownCollector:
         elif event_type == "best_bid_ask":
             self._handle_bba(msg, recv_ns)
 
+    def _is_relevant_market_message(self, msg: dict) -> bool:
+        event_type = msg.get("event_type")
+        if event_type in {"book", "last_trade_price", "best_bid_ask"}:
+            return str(msg.get("asset_id") or "") in self._subscribed_assets
+        if event_type == "price_change":
+            return any(
+                str(change.get("asset_id") or "") in self._subscribed_assets
+                for change in msg.get("price_changes", [])
+                if isinstance(change, dict)
+            )
+        return False
+
     def _handle_book(self, msg: dict, recv_ns: int) -> None:
         asset_id = msg.get("asset_id", "")
+        if asset_id not in self._subscribed_assets:
+            return
         market = msg.get("market", "")
         bids = msg.get("bids", [])
         asks = msg.get("asks", [])
@@ -279,6 +347,8 @@ class UpDownCollector:
         exchange_ts = int(msg.get("timestamp", "0"))
         for change in msg.get("price_changes", []):
             asset_id = change.get("asset_id", "")
+            if asset_id not in self._subscribed_assets:
+                continue
             side = change.get("side", "BUY").lower()
             price = change.get("price", "0")
             size = change.get("size", "0")
@@ -290,6 +360,8 @@ class UpDownCollector:
 
     def _handle_trade(self, msg: dict, recv_ns: int) -> None:
         asset_id = msg.get("asset_id", "")
+        if asset_id not in self._subscribed_assets:
+            return
         slug = self._subscribed_assets.get(asset_id, "")
         row = {
             "source": f"polymarket:{slug}" if slug else "polymarket",
@@ -307,6 +379,8 @@ class UpDownCollector:
 
     def _handle_bba(self, msg: dict, recv_ns: int) -> None:
         asset_id = msg.get("asset_id", "")
+        if asset_id not in self._subscribed_assets:
+            return
         slug = self._subscribed_assets.get(asset_id, "")
         row = {
             "source": f"polymarket:{slug}" if slug else "polymarket",

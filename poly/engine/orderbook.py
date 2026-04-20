@@ -44,6 +44,10 @@ class OrderBookEngine:
             return None
         return book.depth_summary()
 
+    def remove(self, asset_id: str) -> None:
+        """Drop local state for an asset that is no longer subscribed."""
+        self._books.pop(asset_id, None)
+
     def top_n(self, asset_id: str, n: int = 10) -> tuple[list, list] | None:
         book = self._books.get(asset_id)
         if book is None:
