@@ -52,7 +52,6 @@ def read_parquet_safe(path: Path, table_name: str) -> TableLoadResult:
 
 def load_date_tables(data_dir: Path, date: str) -> dict[str, TableLoadResult]:
     specs = {
-        "poly_l2_book": ("normalized", "poly_l2_book"),
         "poly_best_bid_ask": ("normalized", "poly_best_bid_ask"),
         "poly_trades": ("normalized", "poly_trades"),
         "binance_l2_book": ("normalized", "binance_l2_book"),
@@ -63,6 +62,11 @@ def load_date_tables(data_dir: Path, date: str) -> dict[str, TableLoadResult]:
         "poly_markout_labels": ("research", "poly_markout_labels"),
         "binance_markout_labels": ("research", "binance_markout_labels"),
     }
+    sampled_path = table_path(data_dir, "normalized", date, "poly_sampled_book")
+    if sampled_path.exists():
+        specs["poly_sampled_book"] = ("normalized", "poly_sampled_book")
+    else:
+        specs["poly_l2_book"] = ("normalized", "poly_l2_book")
     return {
         name: read_parquet_safe(table_path(data_dir, layer, date, table), name)
         for name, (layer, table) in specs.items()

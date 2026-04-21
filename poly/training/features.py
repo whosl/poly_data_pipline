@@ -144,12 +144,17 @@ def build_date_dataset(
     samples = add_final_profit_labels(
         samples,
         horizon_seconds=config.horizon_seconds,
-        success_profit=config.final_profit_success_price,
+        fee_rate=config.fee_rate,
+        price_buffer=config.price_buffer,
+        max_total_price=config.two_leg_max_total_price,
     )
     return filter_training_rows(samples, config)
 
 
 def choose_poly_book(tables: dict[str, TableLoadResult]) -> pl.DataFrame | None:
+    sampled = get_frame(tables, "poly_sampled_book")
+    if sampled is not None and not sampled.is_empty():
+        return sampled
     enriched = get_frame(tables, "poly_enriched_book")
     if enriched is not None and not enriched.is_empty():
         return enriched
@@ -187,6 +192,8 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
     for col in ["market_id", "condition_id", "slug", "outcome", "symbol", "period"]:
         if col not in df.columns:
             df = df.with_columns(pl.lit("").alias(col))
+    if "start_ns" not in df.columns:
+        df = df.with_columns(pl.lit(None, dtype=pl.Int64).alias("start_ns"))
     if "expiry_ns" not in df.columns:
         df = df.with_columns(pl.lit(None, dtype=pl.Int64).alias("expiry_ns"))
     if "best_bid" not in df.columns:
@@ -232,6 +239,7 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
             pl.col("outcome").cast(pl.String),
             pl.col("symbol").cast(pl.String),
             pl.col("period").cast(pl.String),
+            pl.col("start_ns").cast(pl.Int64),
             pl.col("expiry_ns").cast(pl.Int64),
             pl.col("best_bid").cast(pl.Float64),
             pl.col("best_ask").cast(pl.Float64),
@@ -250,6 +258,7 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
         [
             pl.col("_market_hint").map_elements(extract_market_id, return_dtype=pl.String).alias("_hint_market_id"),
             pl.col("_market_hint").map_elements(extract_symbol, return_dtype=pl.String).alias("_hint_symbol"),
+            pl.col("_market_hint").map_elements(extract_start_ns, return_dtype=pl.Int64).alias("_hint_start_ns"),
             pl.col("_market_hint").map_elements(extract_expiry_ns, return_dtype=pl.Int64).alias("_hint_expiry_ns"),
         ]
     )
@@ -273,7 +282,8 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
             )
             .otherwise(pl.col("symbol"))
             .alias("symbol"),
-            pl.coalesce([pl.col("expiry_ns"), pl.col("_hint_expiry_ns")]).alias("expiry_ns"),
+            pl.coalesce([pl.col("_hint_start_ns"), pl.col("start_ns")]).alias("start_ns"),
+            pl.coalesce([pl.col("_hint_expiry_ns"), pl.col("expiry_ns")]).alias("expiry_ns"),
         ]
     )
     df = df.with_columns(
@@ -303,6 +313,7 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
         "slug",
         "outcome",
         "period",
+        "start_ns",
         "expiry_ns",
         "time_to_expiry_seconds",
         "expiry_bucket",
@@ -865,6 +876,12 @@ def filter_training_rows(samples: pl.DataFrame, config: DatasetConfig) -> pl.Dat
     ]
     present = [c for c in required if c in samples.columns]
     filtered = samples.drop_nulls(present)
+    if {"recv_ns", "expiry_ns"}.issubset(filtered.columns):
+        horizon_ns = config.horizon_seconds * NS_PER_SECOND
+        filtered = filtered.filter(
+            pl.col("expiry_ns").is_null()
+            | ((pl.col("recv_ns") + pl.lit(horizon_ns)) <= pl.col("expiry_ns"))
+        )
     if filtered.is_empty():
         return filtered
     feature_cols = infer_feature_columns(filtered)
@@ -904,6 +921,7 @@ def infer_feature_columns(df: pl.DataFrame) -> list[str]:
         "slug",
         "outcome",
         "period",
+        "start_ns",
         "question",
         "expiry_ns",
         "opposite_asset_id",
@@ -964,15 +982,23 @@ def make_metadata(
     }
 
 
-def write_dataset_artifacts(result: BuildResult, output_dir: Path, basename: str = "alpha_dataset") -> dict[str, str]:
+def write_dataset_artifacts(
+    result: BuildResult,
+    output_dir: Path,
+    basename: str = "alpha_dataset",
+    write_csv: bool = True,
+) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     parquet_path = output_dir / f"{basename}.parquet"
     csv_path = output_dir / f"{basename}.csv"
     metadata_path = output_dir / f"{basename}_metadata.json"
     result.dataset.write_parquet(str(parquet_path))
-    result.dataset.write_csv(str(csv_path))
     save_json(result.metadata, metadata_path)
-    return {"parquet": str(parquet_path), "csv": str(csv_path), "metadata": str(metadata_path)}
+    paths = {"parquet": str(parquet_path), "metadata": str(metadata_path)}
+    if write_csv:
+        result.dataset.write_csv(str(csv_path))
+        paths["csv"] = str(csv_path)
+    return paths
 
 
 def add_quantile_bucket(df: pl.DataFrame, source_col: str, bucket_col: str, n_buckets: int = 10) -> pl.DataFrame:
@@ -1012,10 +1038,25 @@ def extract_expiry_ns(text: str | None) -> int | None:
     match = EXPIRY_RE.search(str(text))
     if not match:
         return None
-    expiry = int(match.group("expiry"))
+    start = int(match.group("expiry"))
+    period = match.group("period").lower()
+    seconds = 300 if period == "5m" else 900 if period == "15m" else 0
+    expiry = start + seconds
     if expiry < 10_000_000_000:
         expiry *= NS_PER_SECOND
     return expiry
+
+
+def extract_start_ns(text: str | None) -> int | None:
+    if not text:
+        return None
+    match = EXPIRY_RE.search(str(text))
+    if not match:
+        return None
+    start = int(match.group("expiry"))
+    if start < 10_000_000_000:
+        start *= NS_PER_SECOND
+    return start
 
 
 def infer_symbol_from_asset(asset_expr: pl.Expr) -> pl.Expr:

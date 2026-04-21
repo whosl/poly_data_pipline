@@ -22,7 +22,8 @@ class DatasetConfig:
     two_leg_max_total_price: float = 0.96
     two_leg_no_fill_edge: float = -1.0
     two_leg_maker_fill_trade_side: str = "SELL"
-    final_profit_success_price: float = 0.02
+    fee_rate: float = 0.072
+    price_buffer: float = 0.01
     taker_cost_bps: float = 0.0
     slippage_buffer_bps: float = 2.0
     safety_margin_bps: float = 1.0

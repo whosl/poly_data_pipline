@@ -179,9 +179,24 @@ def add_two_leg_maker_fill_labels(
 def add_final_profit_labels(
     samples: pl.DataFrame,
     horizon_seconds: int,
-    success_profit: float,
+    fee_rate: float = 0.072,
+    price_buffer: float = 0.01,
+    max_total_price: float = 0.96,
 ) -> pl.DataFrame:
-    """Realized payoff target for a capped-win / first-leg-unwind-loss strategy."""
+    """Realized payoff target for two-leg capped-win / first-leg-unwind strategy.
+
+    Success (two-leg fills):
+        entry_price     = best_ask
+        first_leg_price = entry_price + price_buffer
+        fee_per_share   = fee_rate * first_leg_price * (1 - first_leg_price)
+        second_leg_size = 1 - fee_per_share              (fee deducted in shares)
+        second_leg_price = max_total_price - entry_price  (opposite-leg maker quote)
+        success_profit  = second_leg_size - (first_leg_price + second_leg_size * second_leg_price)
+
+    Failure (unwind first leg):
+        unwind_loss = first_leg_price - second_leg_size * future_best_bid
+        failure_profit = -unwind_loss
+    """
     future_mid_col = f"future_mid_{horizon_seconds}s"
     future_bid_col = f"future_best_bid_{horizon_seconds}s"
     two_leg_cls_col = f"y_two_leg_entry_{horizon_seconds}s"
@@ -191,12 +206,23 @@ def add_final_profit_labels(
     cls_col = f"y_final_profit_entry_{horizon_seconds}s"
     binary_col = f"y_final_profit_entry_binary_{horizon_seconds}s"
 
+    entry_price = pl.col("best_ask")
+    first_leg_price = entry_price + pl.lit(price_buffer)
+    fee_per_share = pl.lit(fee_rate) * first_leg_price * (1.0 - first_leg_price)
+    second_leg_size = 1.0 - fee_per_share
+    second_leg_price = pl.lit(max_total_price) - entry_price
+
+    # Success profit (per share): revenue - cost = second_leg_size - (first_leg_price + second_leg_size * second_leg_price)
+    success_profit = second_leg_size - (first_leg_price + second_leg_size * second_leg_price)
+
+    # Unwind loss: bought at first_leg_price, sell back at future bid, but only own second_leg_size shares
     unwind_reference = pl.col(future_bid_col) if future_bid_col in samples.columns else pl.col(future_mid_col)
-    unwind_loss = (pl.col("best_ask") - unwind_reference).clip(0, None)
+    unwind_loss = (first_leg_price - second_leg_size * unwind_reference).clip(0, None)
+
     final_profit = (
         pl.when(pl.col(two_leg_cls_col) == "enter")
-        .then(pl.lit(success_profit))
-        .otherwise(-pl.col(unwind_loss_col))
+        .then(success_profit)
+        .otherwise(-unwind_loss)
     )
     return (
         samples.with_columns(unwind_loss.alias(unwind_loss_col))

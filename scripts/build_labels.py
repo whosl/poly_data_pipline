@@ -29,7 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--two-leg-max-total-price", type=float, default=0.96)
     parser.add_argument("--two-leg-no-fill-edge", type=float, default=-1.0)
     parser.add_argument("--two-leg-maker-fill-trade-side", default="SELL")
-    parser.add_argument("--final-profit-success-price", type=float, default=0.02)
+    parser.add_argument("--fee-rate", type=float, default=0.072)
+    parser.add_argument("--price-buffer", type=float, default=0.01)
     return parser.parse_args()
 
 
@@ -51,7 +52,8 @@ def main() -> None:
             two_leg_max_total_price=args.two_leg_max_total_price,
             two_leg_no_fill_edge=args.two_leg_no_fill_edge,
             two_leg_maker_fill_trade_side=args.two_leg_maker_fill_trade_side,
-            final_profit_success_price=args.final_profit_success_price,
+            fee_rate=args.fee_rate,
+            price_buffer=args.price_buffer,
         )
         result = build_training_dataset(config)
         df = result.dataset

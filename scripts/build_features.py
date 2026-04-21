@@ -31,12 +31,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--two-leg-max-total-price", type=float, default=0.96)
     parser.add_argument("--two-leg-no-fill-edge", type=float, default=-1.0)
     parser.add_argument("--two-leg-maker-fill-trade-side", default="SELL")
-    parser.add_argument("--final-profit-success-price", type=float, default=0.02)
+    parser.add_argument("--fee-rate", type=float, default=0.072)
+    parser.add_argument("--price-buffer", type=float, default=0.01)
     parser.add_argument("--taker-cost-bps", type=float, default=0.0)
     parser.add_argument("--slippage-buffer-bps", type=float, default=2.0)
     parser.add_argument("--safety-margin-bps", type=float, default=1.0)
     parser.add_argument("--join-tolerance-ms", type=int, default=500)
     parser.add_argument("--basename", default="alpha_dataset")
+    parser.add_argument("--no-csv", action="store_true", help="Only write parquet + metadata artifacts.")
     return parser.parse_args()
 
 
@@ -58,14 +60,15 @@ def main() -> None:
         two_leg_max_total_price=args.two_leg_max_total_price,
         two_leg_no_fill_edge=args.two_leg_no_fill_edge,
         two_leg_maker_fill_trade_side=args.two_leg_maker_fill_trade_side,
-        final_profit_success_price=args.final_profit_success_price,
+        fee_rate=args.fee_rate,
+        price_buffer=args.price_buffer,
         taker_cost_bps=args.taker_cost_bps,
         slippage_buffer_bps=args.slippage_buffer_bps,
         safety_margin_bps=args.safety_margin_bps,
         join_tolerance_ms=args.join_tolerance_ms,
     )
     result = build_training_dataset(config)
-    paths = write_dataset_artifacts(result, args.output_dir, args.basename)
+    paths = write_dataset_artifacts(result, args.output_dir, args.basename, write_csv=not args.no_csv)
     print(f"rows={result.dataset.height}")
     for key, value in paths.items():
         print(f"{key}={value}")

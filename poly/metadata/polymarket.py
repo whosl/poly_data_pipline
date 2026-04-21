@@ -75,18 +75,30 @@ def discover_slugs_from_local_data(data_dir: Path, date: str) -> list[str]:
         if not path.exists():
             continue
         try:
-            df = pl.read_parquet(str(path), columns=[c for c in ["recv_ns", "source"] if c])
+            schema = pl.read_parquet_schema(str(path))
+            scan = pl.scan_parquet(str(path))
         except Exception:
             continue
-        if "source" in df.columns:
-            for source in df["source"].drop_nulls().unique().to_list():
+        if "source" in schema:
+            try:
+                sources = scan.select(pl.col("source").drop_nulls().unique()).collect()
+            except Exception:
+                sources = pl.DataFrame()
+            for source in sources.get_column("source").to_list() if "source" in sources.columns else []:
                 if isinstance(source, str) and source.startswith("polymarket:"):
                     slug = source.split(":", 1)[1]
                     if slug:
                         slugs.add(slug)
-        if "recv_ns" in df.columns and not df.is_empty():
-            table_min = df["recv_ns"].min()
-            table_max = df["recv_ns"].max()
+        if "recv_ns" in schema:
+            try:
+                bounds = scan.select(
+                    pl.col("recv_ns").min().alias("min_ns"),
+                    pl.col("recv_ns").max().alias("max_ns"),
+                ).collect()
+            except Exception:
+                bounds = pl.DataFrame()
+            table_min = bounds["min_ns"][0] if "min_ns" in bounds.columns and not bounds.is_empty() else None
+            table_max = bounds["max_ns"][0] if "max_ns" in bounds.columns and not bounds.is_empty() else None
             if table_min is not None:
                 min_ns = table_min if min_ns is None else min(min_ns, table_min)
             if table_max is not None:
@@ -135,6 +147,16 @@ def parse_updown_slug(slug: str) -> tuple[str | None, str | None, int | None, in
     return symbol, period, start * 1_000_000_000, expiry * 1_000_000_000 if expiry else None
 
 
+def updown_expiry_ns(slug_expiry_ns: int | None, end_date: object) -> int | None:
+    """Prefer slug-derived expiry for UpDown markets.
+
+    Some Polymarket API responses expose an `endDate` rounded to the UTC date
+    rather than the 5m/15m market expiry. The slug timestamp is the start time,
+    so `parse_updown_slug` gives the exact short-market expiry.
+    """
+    return slug_expiry_ns or iso_to_ns(end_date)
+
+
 def market_to_asset_rows(market: dict) -> list[dict[str, object]]:
     token_ids = parse_json_list(market.get("clobTokenIds"))
     outcomes = parse_json_list(market.get("outcomes"))
@@ -144,7 +166,7 @@ def market_to_asset_rows(market: dict) -> list[dict[str, object]]:
     slug = str(market.get("slug") or "")
     symbol, period, start_ns, slug_expiry_ns = parse_updown_slug(slug)
     end_date = market.get("endDate")
-    expiry_ns = iso_to_ns(end_date) or slug_expiry_ns
+    expiry_ns = updown_expiry_ns(slug_expiry_ns, end_date)
     outcomes_json = json.dumps(outcomes, ensure_ascii=False)
     token_ids_json = json.dumps(token_ids, ensure_ascii=False)
 
@@ -195,7 +217,7 @@ def clob_market_to_asset_rows(market: dict) -> list[dict[str, object]]:
     slug = str(market.get("market_slug") or "")
     symbol, period, start_ns, slug_expiry_ns = parse_updown_slug(slug)
     end_date = market.get("end_date_iso")
-    expiry_ns = iso_to_ns(end_date) or slug_expiry_ns
+    expiry_ns = updown_expiry_ns(slug_expiry_ns, end_date)
     token_ids = [str(t.get("token_id") or "") for t in tokens if isinstance(t, dict)]
     outcomes = [str(t.get("outcome") or "") for t in tokens if isinstance(t, dict)]
 
@@ -258,7 +280,10 @@ def discover_condition_ids_from_local_data(data_dir: Path, date: str) -> list[st
         if not path.exists():
             continue
         try:
-            df = pl.read_parquet(str(path), columns=["market"])
+            schema = pl.read_parquet_schema(str(path))
+            if "market" not in schema:
+                continue
+            df = pl.scan_parquet(str(path)).select(pl.col("market").drop_nulls().unique()).collect()
         except Exception:
             continue
         for value in df["market"].drop_nulls().unique().to_list():
@@ -414,6 +439,7 @@ def enrich_with_metadata(frame: pl.DataFrame, metadata: pl.DataFrame) -> pl.Data
             "symbol",
             "period",
             "question",
+            "start_ns",
             "expiry_ns",
             "tick_size",
             "min_order_size",

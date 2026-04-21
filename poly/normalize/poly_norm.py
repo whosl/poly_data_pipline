@@ -15,6 +15,9 @@ logger = structlog.get_logger()
 class PolyNormalizer:
     """Normalize raw Polymarket JSONL into analysis-ready Parquet."""
 
+    # Flush accumulated rows to disk every this many messages
+    _FLUSH_INTERVAL = 500_000
+
     def run(self, data_dir: Path, date: str) -> None:
         raw_path = data_dir / "raw_feed" / date / "polymarket_market.jsonl.gz"
         if not raw_path.exists():
@@ -23,13 +26,41 @@ class PolyNormalizer:
 
         out_dir = data_dir / "normalized" / date
         out_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = out_dir / "_parts"
+        tmp_dir.mkdir(exist_ok=True)
 
         l2_rows: list[dict] = []
         trade_rows: list[dict] = []
         bba_rows: list[dict] = []
+        batch_idx = 0
+        total_counts = {"l2": 0, "trade": 0, "bba": 0}
 
         import poly_core
         books: dict[str, poly_core.OrderBook] = {}
+
+        def _flush_batch() -> None:
+            nonlocal batch_idx, l2_rows, trade_rows, bba_rows
+            if not (l2_rows or trade_rows or bba_rows):
+                return
+            batch_idx += 1
+            if l2_rows:
+                self._enrich(pl.DataFrame(l2_rows), data_dir, date).write_parquet(
+                    str(tmp_dir / f"l2_part{batch_idx}.parquet"))
+                total_counts["l2"] += len(l2_rows)
+                l2_rows = []
+            if trade_rows:
+                self._enrich(pl.DataFrame(trade_rows), data_dir, date).write_parquet(
+                    str(tmp_dir / f"trade_part{batch_idx}.parquet"))
+                total_counts["trade"] += len(trade_rows)
+                trade_rows = []
+            if bba_rows:
+                self._enrich(pl.DataFrame(bba_rows), data_dir, date).write_parquet(
+                    str(tmp_dir / f"bba_part{batch_idx}.parquet"))
+                total_counts["bba"] += len(bba_rows)
+                bba_rows = []
+            logger.info("poly_norm_flush", batch=batch_idx,
+                        l2=total_counts["l2"], trade=total_counts["trade"],
+                        bba=total_counts["bba"])
 
         count = 0
         for line in iter_recovered_gzip_jsonl_lines(raw_path):
@@ -58,19 +89,38 @@ class PolyNormalizer:
                 self._process_msg(msg, recv_ns, books, l2_rows, trade_rows, bba_rows)
                 count += 1
 
-        if l2_rows:
-            self._enrich(pl.DataFrame(l2_rows), data_dir, date).write_parquet(str(out_dir / "poly_l2_book.parquet"))
-            logger.info("poly_norm_l2", rows=len(l2_rows))
+            # Periodic flush to keep memory bounded
+            if count - (total_counts["l2"] + total_counts["trade"] + total_counts["bba"]) >= self._FLUSH_INTERVAL:
+                _flush_batch()
 
-        if trade_rows:
-            self._enrich(pl.DataFrame(trade_rows), data_dir, date).write_parquet(str(out_dir / "poly_trades.parquet"))
-            logger.info("poly_norm_trades", rows=len(trade_rows))
+        # Final flush for remaining rows
+        _flush_batch()
 
-        if bba_rows:
-            self._enrich(pl.DataFrame(bba_rows), data_dir, date).write_parquet(str(out_dir / "poly_best_bid_ask.parquet"))
-            logger.info("poly_norm_bba", rows=len(bba_rows))
+        # Concatenate all part files into final parquet
+        self._concat_parts(tmp_dir, out_dir, "l2_part", "poly_l2_book.parquet", total_counts["l2"])
+        self._concat_parts(tmp_dir, out_dir, "trade_part", "poly_trades.parquet", total_counts["trade"])
+        self._concat_parts(tmp_dir, out_dir, "bba_part", "poly_best_bid_ask.parquet", total_counts["bba"])
 
-        logger.info("poly_norm_done", date=date, total_messages=count)
+        # Clean up temp directory
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        logger.info("poly_norm_done", date=date, total_messages=count,
+                    l2=total_counts["l2"], trades=total_counts["trade"],
+                    bba=total_counts["bba"])
+
+    @staticmethod
+    def _concat_parts(tmp_dir: Path, out_dir: Path, prefix: str, final_name: str, total: int) -> None:
+        parts = sorted(tmp_dir.glob(f"{prefix}*.parquet"))
+        if not parts:
+            return
+        if len(parts) == 1:
+            # Only one part — just rename
+            parts[0].rename(out_dir / final_name)
+        else:
+            scans = [pl.scan_parquet(str(p)) for p in parts]
+            pl.concat(scans, how="diagonal_relaxed").sink_parquet(str(out_dir / final_name))
+        logger.info("poly_norm_concat", file=final_name, parts=len(parts), rows=total)
 
     def _process_msg(self, msg: dict, recv_ns: int, books: dict,
                      l2_rows: list, trade_rows: list, bba_rows: list) -> None:
