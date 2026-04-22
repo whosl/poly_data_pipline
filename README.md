@@ -131,6 +131,14 @@ python -m poly.main labels 20260417
 
 ### 训练目标和目标策略
 
+给 coding agent 的完整分层文档从这里开始：
+
+- [`docs/agent_manual.md`](docs/agent_manual.md) — 总览入口
+- [`docs/agent/training_strategy.md`](docs/agent/training_strategy.md) — 当前训练目标、收益公式、两阶段策略
+- [`docs/agent/features_and_labels.md`](docs/agent/features_and_labels.md) — 特征/标签/泄漏规则
+- [`docs/agent/experiments.md`](docs/agent/experiments.md) — 关键实验结果和 caveat
+- [`docs/agent/live_monitoring.md`](docs/agent/live_monitoring.md) — Ireland live-shadow 监控说明
+
 训练管线优先使用 `data/normalized` 和 `data/research` 里的 Parquet，不直接从 raw JSONL 训练。当前训练目标不是预测 Polymarket 最终结算方向，而是验证 BTC/ETH Up/Down 市场里是否存在 5s/10s 级别的可交易微观结构 edge。
 
 目标策略是 two-leg round trip：
@@ -138,7 +146,7 @@ python -m poly.main labels 20260417
 1. 第一腿：用 taker 直接买入当前 asset，成交价近似为当前 `best_ask`。
 2. 第二腿：在 opposite outcome 上挂 maker，目标是在 10 秒内用更好的价格补上反向腿。
 3. 交易判定：如果 `first_leg_ask + future_opposite_maker_fill_price <= 0.96`，认为这次 entry 有足够空间 cover fee/slippage/safety margin。
-4. 当前简化收益：成功记 `+0.02`，失败用同腿未来 bid 卖出撤退，亏损近似为 `-max(first_leg_ask - future_best_bid_10s, 0)`。这里的 `future_best_bid_10s` 是当前样本同一个 asset 的未来 bid label。
+4. 当前收益按实际两腿/撤退公式计算：成功时用 `second_leg_size - (first_leg_price + second_leg_size * second_leg_quote)`；失败时用同腿未来 bid 撤退，`unwind_profit = second_leg_size * future_best_bid_10s - first_leg_price`。这里的 `future_best_bid_10s` 是当前样本同一个 asset 的未来 bid label。
 
 因此当前最重要的模型不是“最终涨跌模型”，而是 `p_enter` classifier：给定当前订单簿、Binance 参考行情、regime 状态，预测这笔 first-leg taker entry 后，第二腿 maker 是否有机会在 10 秒内让 round trip 成立。
 
@@ -159,13 +167,14 @@ python -m poly.main labels 20260417
 | `future_opposite_maker_fill_price_10s` | 10 秒内 opposite asset 上可观察到的 maker fill 价格证据 |
 | `two_leg_total_price_10s` | `best_ask + future_opposite_maker_fill_price_10s` |
 | `y_two_leg_entry_10s` | `two_leg_total_price_10s <= 0.96` 时为 `enter` |
-| `first_unwind_loss_proxy_10s` | 第二腿失败时，第一腿用未来同腿 best bid 撤退的亏损 proxy |
-| `final_profit_10s` | 成功 `+0.02`，失败 `-first_unwind_loss_proxy_10s` |
+| `first_unwind_loss_proxy_10s` | 第二腿失败时，第一腿用未来同腿 best bid 撤退的 loss proxy；对应 profit 可以为正 |
+| `first_unwind_profit_proxy_10s` | `second_leg_size * future_best_bid_10s - first_leg_price`，signed unwind PnL |
+| `final_profit_10s` | 成功用 two-leg success profit，失败用 signed unwind profit |
 | `y_final_profit_entry_10s` | 当前主训练分类目标：`final_profit_10s > 0` 为 `enter` |
 
 训练时只能使用当下可见 feature。所有 `future_*`、`markout_*`、`two_leg_*`、`final_profit_*`、`y_*` 列都属于未来标签/评估列，禁止进模型。
 
-给后续 coding agent 的详细接手说明见 [`docs/training_agent_guide.md`](docs/training_agent_guide.md)。
+给后续 coding agent 的详细接手说明见 [`docs/agent_manual.md`](docs/agent_manual.md)。
 
 当前无泄漏版 feature list（单 Binance symbol 时，Binance reference 按时间戳 asof join）：
 
@@ -176,6 +185,7 @@ python -m poly.main labels 20260417
 | Polymarket book event activity | `book_update_count_100ms`, `book_update_count_500ms`, `book_update_count_1s`, `spread_widen_count_recent`, `spread_narrow_count_recent`, `realized_vol_short` |
 | Polymarket short return | `poly_return_1s` |
 | Binance reference | `binance_mid`, `binance_spread`, `binance_return_tick`, `binance_return_100ms`, `binance_return_500ms`, `binance_return_1s`, `binance_return_3s`, `binance_recent_trade_imbalance` |
+| Binance compact depth | `binance_microprice`, `binance_imbalance`, `binance_depth_top1_imbalance`, `binance_depth_top3_imbalance`, `binance_depth_top5_imbalance`, `binance_depth_top10_imbalance`, `binance_depth_top20_imbalance`, `binance_cum_bid_depth_top1/3/5/10/20`, `binance_cum_ask_depth_top1/3/5/10/20`, `binance_bid_depth_slope_top10/20`, `binance_ask_depth_slope_top10/20`, `binance_near_touch_bid_notional_5/10/20`, `binance_near_touch_ask_notional_5/10/20` |
 | Lead-lag | `lead_lag_binance_minus_poly_1s`, `lead_lag_binance_minus_poly_500ms` |
 | Regime / metadata / research buckets | `time_to_expiry_seconds`, `tick_size`, `min_order_size`, `maker_base_fee`, `taker_base_fee`, `imbalance_bucket`, `spread_bucket`, `price_bucket`, `vol_bucket`, `vol_60s`; `volume_24h`/`liquidity` are carried when non-null |
 

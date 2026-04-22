@@ -1047,6 +1047,16 @@ class PredictionPipeline:
         signal: bool,
     ) -> None:
         self._block_counts["samples"] += 1
+        if raw_signal:
+            self._block_counts["pass_threshold"] += 1
+        if p_fill_ok:
+            self._block_counts["pass_p_fill"] += 1
+        if unwind_ok:
+            self._block_counts["pass_unwind"] += 1
+        if raw_signal and p_fill_ok and unwind_ok:
+            self._block_counts["pass_model_gates"] += 1
+        if raw_signal and p_fill_ok and unwind_ok and entry_filter_ok and has_opposite:
+            self._block_counts["pass_model_and_entry_gates"] += 1
         if signal:
             self._block_counts["signals"] += 1
             return
