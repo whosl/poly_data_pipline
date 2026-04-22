@@ -3,8 +3,8 @@
 
 Usage:
     python scripts/live_predict.py --model xgboost_classifier --threshold 0.67
-    python scripts/live_predict.py --model lightgbm_classifier --threshold 0.81 --sample-interval 200
-    python scripts/live_predict.py --model-path artifacts/training_s3_filtered_20260420_21_5m/final_profit_models/lightgbm_classifier.joblib
+    python scripts/live_predict.py --model random_forest_classifier --threshold 0.751182 --sample-interval 100
+    python scripts/live_predict.py --model-path artifacts/training_reprofit_20260420_21_5m/final_profit_models/random_forest_classifier.joblib
 """
 
 from __future__ import annotations
@@ -31,8 +31,9 @@ from poly.predict.pipeline import PredictionPipeline
 
 structlog.configure(
     processors=[
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.add_log_level,
-        structlog.dev.ConsoleRenderer(),
+        structlog.processors.JSONRenderer(),
     ]
 )
 logger = structlog.get_logger()
@@ -40,14 +41,27 @@ logger = structlog.get_logger()
 
 async def run_pipeline(
     model_name: str = "xgboost_classifier",
-    model_dir: str | Path = "artifacts/training_s3_filtered_20260420_21_5m/final_profit_models",
+    model_dir: str | Path = "artifacts/training_reprofit_20260420_21_5m/final_profit_models",
     model_path: str | Path | None = None,
+    unwind_model_name: str | None = None,
+    unwind_model_dir: str | Path | None = None,
+    unwind_model_path: str | Path | None = None,
     threshold: float = 0.6,
+    min_p_fill: float = 0.0,
+    min_pred_unwind_profit: float = -1.0,
     sample_interval_ms: int = 100,
     horizon_seconds: int = 10,
     fee_rate: float = 0.072,
     price_buffer: float = 0.01,
     symbols: str = "btcusdt",
+    signal_cooldown_seconds: float | None = None,
+    log_near_threshold: bool = False,
+    stats_interval: int = 1000,
+    min_entry_ask: float = 0.05,
+    max_entry_ask: float = 0.95,
+    min_time_to_expiry: float = 20.0,
+    max_spread: float = 0.05,
+    max_entries_per_signal_key: int = 0,
 ) -> None:
     config = get_config()
 
@@ -56,15 +70,36 @@ async def run_pipeline(
     if not resolved_model_path.exists():
         logger.error("model_not_found", path=str(resolved_model_path))
         return
+    resolved_unwind_model_path = None
+    if unwind_model_path or unwind_model_name:
+        if unwind_model_path:
+            resolved_unwind_model_path = Path(unwind_model_path)
+        else:
+            base = Path(unwind_model_dir) if unwind_model_dir else Path(model_dir)
+            resolved_unwind_model_path = base / f"{unwind_model_name}.joblib"
+        if not resolved_unwind_model_path.exists():
+            logger.error("unwind_model_not_found", path=str(resolved_unwind_model_path))
+            return
 
     # Init pipeline
     pipeline = PredictionPipeline(
         model_path=resolved_model_path,
+        unwind_model_path=resolved_unwind_model_path,
         threshold=threshold,
+        min_p_fill=min_p_fill,
+        min_pred_unwind_profit=min_pred_unwind_profit,
         sample_interval_ms=sample_interval_ms,
         horizon_seconds=horizon_seconds,
         fee_rate=fee_rate,
         price_buffer=price_buffer,
+        signal_cooldown_seconds=signal_cooldown_seconds,
+        log_near_threshold=log_near_threshold,
+        stats_interval=stats_interval,
+        min_entry_ask=min_entry_ask,
+        max_entry_ask=max_entry_ask,
+        min_time_to_expiry_seconds=min_time_to_expiry,
+        max_spread=max_spread,
+        max_entries_per_signal_key=max_entries_per_signal_key,
     )
     engine = OrderBookEngine()
 
@@ -72,11 +107,23 @@ async def run_pipeline(
         "pipeline_starting",
         model=model_name,
         model_path=str(resolved_model_path),
+        unwind_model=unwind_model_name,
+        unwind_model_path=str(resolved_unwind_model_path) if resolved_unwind_model_path else None,
         threshold=threshold,
+        min_p_fill=min_p_fill,
+        min_pred_unwind_profit=min_pred_unwind_profit,
         sample_interval_ms=sample_interval_ms,
         horizon_seconds=horizon_seconds,
         fee_rate=fee_rate,
         price_buffer=price_buffer,
+        signal_cooldown_seconds=signal_cooldown_seconds if signal_cooldown_seconds is not None else horizon_seconds,
+        log_near_threshold=log_near_threshold,
+        stats_interval=stats_interval,
+        min_entry_ask=min_entry_ask,
+        max_entry_ask=max_entry_ask,
+        min_time_to_expiry=min_time_to_expiry,
+        max_spread=max_spread,
+        max_entries_per_signal_key=max_entries_per_signal_key,
     )
 
     shutdown_event = asyncio.Event()
@@ -334,11 +381,11 @@ async def _heartbeat(ws, interval: float, shutdown: asyncio.Event) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 @click.command()
-@click.option("--model", default="xgboost_classifier", help="Model name (e.g. xgboost_classifier, lightgbm_classifier)")
+@click.option("--model", default="xgboost_classifier", help="Model name (e.g. xgboost_classifier, random_forest_classifier)")
 @click.option(
     "--model-dir",
     type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
-    default=Path("artifacts/training_s3_filtered_20260420_21_5m/final_profit_models"),
+    default=Path("artifacts/training_reprofit_20260420_21_5m/final_profit_models"),
     show_default=True,
     help="Directory containing <model>.joblib and training_metadata.json.",
 )
@@ -348,24 +395,94 @@ async def _heartbeat(ws, interval: float, shutdown: asyncio.Event) -> None:
     default=None,
     help="Explicit model .joblib path. Takes precedence over --model-dir/--model.",
 )
-@click.option("--threshold", type=float, default=0.6, help="Prediction probability threshold")
+@click.option("--unwind-model", default=None, help="Optional unwind regressor model name for two-stage execution policy.")
+@click.option(
+    "--unwind-model-dir",
+    type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
+    default=None,
+    help="Directory containing <unwind-model>.joblib.",
+)
+@click.option(
+    "--unwind-model-path",
+    type=click.Path(path_type=Path, file_okay=True, dir_okay=False),
+    default=None,
+    help="Explicit unwind regressor .joblib path.",
+)
+@click.option("--threshold", type=float, default=0.6, help="Probability threshold, or expected-profit threshold in two-stage mode.")
+@click.option("--min-p-fill", type=float, default=0.0, show_default=True, help="Minimum fill probability in two-stage mode.")
+@click.option(
+    "--min-pred-unwind-profit",
+    type=float,
+    default=-1.0,
+    show_default=True,
+    help="Minimum predicted signed unwind profit in two-stage mode.",
+)
 @click.option("--sample-interval", type=int, default=100, help="Sampling interval in ms")
 @click.option("--horizon", type=int, default=10, help="Monitoring horizon in seconds")
 @click.option("--fee-rate", type=float, default=0.072, help="Polymarket fee rate per share")
 @click.option("--price-buffer", type=float, default=0.01, help="Price buffer above best_ask for taker fill")
 @click.option("--symbols", default="btcusdt", help="Binance symbols")
-def main(model, model_dir, model_path, threshold, sample_interval, horizon, fee_rate, price_buffer, symbols):
+@click.option(
+    "--signal-cooldown",
+    type=float,
+    default=None,
+    help="Minimum seconds between recorded signals for the same market/outcome. Defaults to --horizon.",
+)
+@click.option("--log-near-threshold", is_flag=True, help="Also log non-signal predictions near the threshold.")
+@click.option("--stats-interval", type=int, default=1000, show_default=True, help="Prediction count interval for stats logs.")
+@click.option("--min-entry-ask", type=float, default=0.05, show_default=True, help="Skip live signals below this first-leg ask.")
+@click.option("--max-entry-ask", type=float, default=0.95, show_default=True, help="Skip live signals above this first-leg ask.")
+@click.option("--min-time-to-expiry", type=float, default=20.0, show_default=True, help="Skip live signals with less time to expiry.")
+@click.option("--max-spread", type=float, default=0.05, show_default=True, help="Skip live signals when Polymarket spread is wider than this.")
+@click.option("--max-entries-per-signal-key", type=int, default=0, show_default=True, help="0 means unlimited; key is market/outcome.")
+def main(
+    model,
+    model_dir,
+    model_path,
+    unwind_model,
+    unwind_model_dir,
+    unwind_model_path,
+    threshold,
+    min_p_fill,
+    min_pred_unwind_profit,
+    sample_interval,
+    horizon,
+    fee_rate,
+    price_buffer,
+    symbols,
+    signal_cooldown,
+    log_near_threshold,
+    stats_interval,
+    min_entry_ask,
+    max_entry_ask,
+    min_time_to_expiry,
+    max_spread,
+    max_entries_per_signal_key,
+):
     """Start live prediction pipeline with outcome monitoring."""
     asyncio.run(run_pipeline(
         model_name=model,
         model_dir=model_dir,
         model_path=model_path,
+        unwind_model_name=unwind_model,
+        unwind_model_dir=unwind_model_dir,
+        unwind_model_path=unwind_model_path,
         threshold=threshold,
+        min_p_fill=min_p_fill,
+        min_pred_unwind_profit=min_pred_unwind_profit,
         sample_interval_ms=sample_interval,
         horizon_seconds=horizon,
         fee_rate=fee_rate,
         price_buffer=price_buffer,
         symbols=symbols,
+        signal_cooldown_seconds=signal_cooldown,
+        log_near_threshold=log_near_threshold,
+        stats_interval=stats_interval,
+        min_entry_ask=min_entry_ask,
+        max_entry_ask=max_entry_ask,
+        min_time_to_expiry=min_time_to_expiry,
+        max_spread=max_spread,
+        max_entries_per_signal_key=max_entries_per_signal_key,
     ))
 
 

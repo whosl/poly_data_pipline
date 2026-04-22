@@ -906,6 +906,7 @@ def infer_feature_columns(df: pl.DataFrame) -> list[str]:
         "future_opposite_maker_fill_",
         "two_leg_",
         "first_unwind_loss_proxy_",
+        "first_unwind_profit_proxy_",
         "final_profit_",
         "final_profit_weight_",
     )
@@ -961,6 +962,7 @@ def make_metadata(
         or c.startswith("future_opposite_maker_fill_")
         or c.startswith("two_leg_")
         or c.startswith("first_unwind_loss_proxy_")
+        or c.startswith("first_unwind_profit_proxy_")
         or c.startswith("final_profit_")
         or c.startswith("final_profit_weight_")
     ]

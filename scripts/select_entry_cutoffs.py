@@ -46,6 +46,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold-step", type=float, default=0.01)
     parser.add_argument("--top-k-candidates", nargs="*", type=int, default=[50, 100, 250, 500, 1000, 2500, 5000])
     parser.add_argument("--min-validation-entries", type=int, default=100)
+    parser.add_argument(
+        "--selection-mode",
+        choices=["row", "live"],
+        default="row",
+        help="row selects every row above threshold; live applies threshold-crossing, cooldown, and entry filters.",
+    )
+    parser.add_argument("--signal-cooldown-seconds", type=float, default=10.0)
+    parser.add_argument("--max-entries-per-signal-key", type=int, default=0, help="0 means unlimited.")
+    parser.add_argument("--min-entry-ask", type=float, default=0.05)
+    parser.add_argument("--max-entry-ask", type=float, default=0.95)
+    parser.add_argument("--min-time-to-expiry", type=float, default=20.0)
+    parser.add_argument("--max-spread", type=float, default=0.05)
     return parser.parse_args()
 
 
@@ -60,6 +72,15 @@ def main() -> None:
         "positive_class": args.positive_class,
         "split_purge_ms": args.split_purge_ms,
         "split_embargo_ms": args.split_embargo_ms,
+        "selection_mode": args.selection_mode,
+        "signal_cooldown_seconds": args.signal_cooldown_seconds,
+        "max_entries_per_signal_key": args.max_entries_per_signal_key,
+        "entry_filters": {
+            "min_entry_ask": args.min_entry_ask,
+            "max_entry_ask": args.max_entry_ask,
+            "min_time_to_expiry": args.min_time_to_expiry,
+            "max_spread": args.max_spread,
+        },
         "runs": [],
     }
 
@@ -95,7 +116,7 @@ def main() -> None:
             )
             model_threshold_rows = []
             for threshold in thresholds:
-                stats = selection_stats(val_scored, args.target_profit, args.target_cls, threshold, "val")
+                stats = selection_stats(val_scored, args.target_profit, args.target_cls, threshold, "val", args)
                 row = {"run": run_name, "model": model_name, "threshold": threshold, **stats}
                 threshold_rows.append(row)
                 model_threshold_rows.append(row)
@@ -111,7 +132,7 @@ def main() -> None:
                 )
                 continue
             threshold = float(best["threshold"])
-            test_stats = selection_stats(test_scored, args.target_profit, args.target_cls, threshold, "test")
+            test_stats = selection_stats(test_scored, args.target_profit, args.target_cls, threshold, "test", args)
             selected_rows.append(
                 {
                     "run": run_name,
@@ -209,11 +230,12 @@ def selection_stats(
     target_cls: str,
     threshold: float,
     prefix: str,
+    args: argparse.Namespace,
 ) -> dict[str, float | int | None]:
     required = [target_profit, "p_enter"]
     if target_cls in df.columns:
         required.append(target_cls)
-    selected = df.filter(pl.col("p_enter") >= threshold).drop_nulls(required)
+    selected = select_rows(df, threshold, args).drop_nulls(required)
     if selected.is_empty():
         return {
             f"{prefix}_entries": 0,
@@ -242,6 +264,83 @@ def selection_stats(
         f"{prefix}_avg_fail_unwind_loss": avg_fail_loss,
         f"{prefix}_avg_p_enter": float(selected["p_enter"].mean()),
     }
+
+
+def select_rows(df: pl.DataFrame, threshold: float, args: argparse.Namespace) -> pl.DataFrame:
+    if args.selection_mode == "row":
+        return df.filter(pl.col("p_enter") >= threshold)
+    return live_like_select_rows(df, threshold, args)
+
+
+def live_like_select_rows(df: pl.DataFrame, threshold: float, args: argparse.Namespace) -> pl.DataFrame:
+    """Mirror live signal gating for offline cutoff selection.
+
+    This intentionally uses simple row iteration because the gating state is
+    threshold-dependent and keyed by asset plus market/outcome.
+    """
+    if df.is_empty():
+        return df
+    rows = df.sort("recv_ns").with_row_index("_row_idx")
+    cooldown_ns = int(args.signal_cooldown_seconds * 1_000_000_000)
+    last_proba_by_asset: dict[str, float] = {}
+    last_signal_ns_by_key: dict[str, int] = {}
+    signal_count_by_key: dict[str, int] = {}
+    selected_indices: list[int] = []
+    max_entries = max(0, int(args.max_entries_per_signal_key))
+
+    needed = {
+        "_row_idx",
+        "recv_ns",
+        "asset_id",
+        "market_id",
+        "slug",
+        "outcome",
+        "opposite_asset_id",
+        "best_bid",
+        "best_ask",
+        "current_spread",
+        "time_to_expiry_seconds",
+        "p_enter",
+    }
+    missing = needed - set(rows.columns)
+    if missing:
+        raise ValueError(f"live selection missing required columns: {sorted(missing)}")
+
+    for row in rows.select(sorted(needed)).iter_rows(named=True):
+        asset_id = str(row["asset_id"])
+        recv_ns = int(row["recv_ns"])
+        proba = row["p_enter"]
+        if proba is None or not np.isfinite(proba):
+            last_proba_by_asset[asset_id] = float("-inf")
+            continue
+
+        prev_proba = last_proba_by_asset.get(asset_id)
+        raw_signal = proba >= threshold
+        crossed_threshold = prev_proba is None or prev_proba < threshold
+        market_key = row.get("market_id") or row.get("slug") or asset_id
+        signal_key = f"{market_key}:{row.get('outcome') or asset_id}"
+        cooldown_ok = recv_ns - last_signal_ns_by_key.get(signal_key, 0) >= cooldown_ns
+        max_entries_ok = max_entries == 0 or signal_count_by_key.get(signal_key, 0) < max_entries
+        has_opposite = row.get("opposite_asset_id") is not None
+        entry_filter_ok = (
+            row["best_bid"] is not None
+            and row["best_ask"] is not None
+            and row["current_spread"] is not None
+            and row["time_to_expiry_seconds"] is not None
+            and row["best_bid"] > 0
+            and args.min_entry_ask <= row["best_ask"] <= args.max_entry_ask
+            and row["current_spread"] <= args.max_spread
+            and row["time_to_expiry_seconds"] >= args.min_time_to_expiry
+        )
+        if raw_signal and crossed_threshold and cooldown_ok and max_entries_ok and has_opposite and entry_filter_ok:
+            selected_indices.append(int(row["_row_idx"]))
+            last_signal_ns_by_key[signal_key] = recv_ns
+            signal_count_by_key[signal_key] = signal_count_by_key.get(signal_key, 0) + 1
+        last_proba_by_asset[asset_id] = float(proba)
+
+    if not selected_indices:
+        return df.head(0)
+    return rows.filter(pl.col("_row_idx").is_in(selected_indices)).drop("_row_idx")
 
 
 if __name__ == "__main__":

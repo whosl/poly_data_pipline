@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+from collections import Counter
 import json
 import time
 from collections import deque
@@ -20,6 +21,43 @@ logger = structlog.get_logger()
 
 NS_PER_MS = 1_000_000
 NS_PER_SECOND = 1_000_000_000
+
+
+def short_id(value: str | None, n: int = 8) -> str:
+    return str(value or "")[:n]
+
+
+def short_slug(value: str | None) -> str:
+    slug = str(value or "")
+    return slug.split("-updown-")[-1] if "-updown-" in slug else slug[:24]
+
+
+def fmt_price(value: float | None) -> str:
+    return "" if value is None else f"{value:.3f}"
+
+
+def fmt_float(value: float | None, digits: int = 6) -> str:
+    return "" if value is None else f"{value:.{digits}f}"
+
+
+def fmt_ms(delta_ns: int | float | None) -> str:
+    return "" if delta_ns is None else f"{float(delta_ns) / NS_PER_MS:.0f}"
+
+
+def quantile_summary(values: list[float]) -> dict[str, float | None]:
+    clean = np.asarray([v for v in values if v is not None and np.isfinite(v)], dtype=float)
+    if clean.size == 0:
+        return {"min": None, "p10": None, "p25": None, "p50": None, "p75": None, "p90": None, "max": None}
+    qs = np.quantile(clean, [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0])
+    return {
+        "min": float(qs[0]),
+        "p10": float(qs[1]),
+        "p25": float(qs[2]),
+        "p50": float(qs[3]),
+        "p75": float(qs[4]),
+        "p90": float(qs[5]),
+        "max": float(qs[6]),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -292,18 +330,33 @@ class LiveFeatureAssembler:
 class PendingPrediction:
     """A prediction waiting for 10s outcome evaluation."""
 
+    signal_id: str
     predict_ns: int
     asset_id: str
     market_id: str
     outcome: str
+    signal_key: str
+    signal_seq_for_key: int
+    best_bid_at_entry: float
     best_ask_at_entry: float
     current_mid_at_entry: float
+    spread_at_entry: float
+    time_to_expiry_at_entry: float
     proba: float
-    opposite_asset_id: str | None
-    slug: str
+    pred_unwind_profit: float | None = None
+    pred_expected_profit: float | None = None
+    decision_score: float | None = None
+    opposite_asset_id: str | None = None
+    slug: str = ""
     two_leg_max_total_price: float = 0.96
     fee_rate: float = 0.072
     price_buffer: float = 0.01
+    second_leg_quote_price: float = 0.0
+    maker_fill_price: float | None = None
+    maker_fill_ns: int | None = None
+    future_best_bid_at_resolve: float | None = None
+    future_best_ask_at_resolve: float | None = None
+    future_mid_at_resolve: float | None = None
 
 
 @dataclass
@@ -340,10 +393,17 @@ class MonitorStats:
 class OutcomeMonitor:
     """Monitors 10-second outcomes for each prediction signal."""
 
-    def __init__(self, horizon_seconds: int = 10, fee_rate: float = 0.072, price_buffer: float = 0.01):
+    def __init__(
+        self,
+        horizon_seconds: int = 10,
+        fee_rate: float = 0.072,
+        price_buffer: float = 0.01,
+        maker_fill_trade_side: str = "SELL",
+    ):
         self.horizon_seconds = horizon_seconds
         self.fee_rate = fee_rate
         self.price_buffer = price_buffer
+        self.maker_fill_trade_side = maker_fill_trade_side.upper()
         self.pending: list[PendingPrediction] = []
         self.stats = MonitorStats()
 
@@ -351,12 +411,46 @@ class OutcomeMonitor:
         self.pending.append(pred)
         self.stats.total_signals += 1
 
+    def observe_trade(self, asset_id: str, side: str, price: float, recv_ns: int) -> None:
+        """Record future opposite trade evidence for pending maker fills.
+
+        This mirrors the offline label: a pending first-leg entry succeeds only
+        if the opposite asset has a future trade on the configured side at or
+        better than our maker quote within the horizon.
+        """
+        if side.upper() != self.maker_fill_trade_side:
+            return
+        for pred in self.pending:
+            if pred.maker_fill_price is not None:
+                continue
+            if pred.opposite_asset_id != asset_id:
+                continue
+            if recv_ns <= pred.predict_ns:
+                continue
+            if recv_ns > pred.predict_ns + self.horizon_seconds * NS_PER_SECOND:
+                continue
+            if price <= pred.second_leg_quote_price:
+                pred.maker_fill_price = price
+                pred.maker_fill_ns = recv_ns
+                logger.info(
+                    "maker_fill_observed",
+                    signal_id=pred.signal_id,
+                    signal_key=pred.signal_key,
+                    slug=short_slug(pred.slug),
+                    outcome=pred.outcome,
+                    asset=short_id(pred.asset_id),
+                    opposite_asset=short_id(pred.opposite_asset_id),
+                    quote_price=fmt_price(pred.second_leg_quote_price),
+                    trade_price=fmt_price(price),
+                    fill_lag_ms=fmt_ms(recv_ns - pred.predict_ns),
+                )
+
     def check_outcomes(
         self,
         now_ns: int,
         asset_books: dict[str, dict],
-    ) -> list[tuple[PendingPrediction, float, str]]:
-        """Check all pending predictions for 10s outcome. Returns list of (pred, profit, outcome)."""
+    ) -> list[tuple[PendingPrediction, dict[str, object]]]:
+        """Check all pending predictions. Returns list of (prediction, outcome details)."""
         resolved = []
         still_pending = []
         for pred in self.pending:
@@ -366,8 +460,7 @@ class OutcomeMonitor:
                 continue
 
             # Evaluate outcome
-            profit, outcome = self._evaluate(pred, asset_books)
-            resolved.append((pred, profit, outcome))
+            resolved.append((pred, self._evaluate(pred, asset_books)))
 
         self.pending = still_pending
         return resolved
@@ -376,67 +469,116 @@ class OutcomeMonitor:
         self,
         pred: PendingPrediction,
         asset_books: dict[str, dict],
-    ) -> tuple[float, str]:
+    ) -> dict[str, object]:
         """Evaluate a single prediction's outcome using actual trading mechanics.
 
         Two-leg strategy:
         - First leg: taker BUY this asset at (best_ask + price_buffer)
         - Fee deducted in shares: fee = fee_rate * first_leg_price * (1 - first_leg_price)
         - Second leg size = 1 - fee (shares remaining after fee)
-        - Second leg: maker SELL opposite asset at (max_total_price - best_ask)
-        - If opposite best_bid enables fill → success, profit = second_leg_size - total_cost
-        - Otherwise → failure, unwind first leg by selling second_leg_size shares at future best_bid
+        - Second leg: maker quote opposite asset at (max_total_price - best_ask)
+        - If a future opposite trade fills that quote within the horizon → success
+        - Otherwise → failure, unwind the first leg at future same-leg best_bid
         """
         # Compute entry parameters (same as labels.py formula)
         entry_price = pred.best_ask_at_entry
         first_leg_price = entry_price + pred.price_buffer
         fee_per_share = pred.fee_rate * first_leg_price * (1.0 - first_leg_price)
         second_leg_size = 1.0 - fee_per_share
-        second_leg_price = pred.two_leg_max_total_price - entry_price
+        second_leg_price = pred.second_leg_quote_price or (pred.two_leg_max_total_price - entry_price)
+        success_first_leg_cost = first_leg_price
+        success_second_leg_cost = second_leg_size * second_leg_price
+        success_total_cost = success_first_leg_cost + success_second_leg_cost
+        success_revenue = second_leg_size
 
         # Get current state of this asset (for unwind)
         my_book = asset_books.get(pred.asset_id, {})
         future_best_bid = my_book.get("best_bid", 0.0)
+        future_best_ask = my_book.get("best_ask", 0.0)
+        future_mid = my_book.get("current_mid", 0.0)
+        pred.future_best_bid_at_resolve = future_best_bid
+        pred.future_best_ask_at_resolve = future_best_ask
+        pred.future_mid_at_resolve = future_mid
 
-        # Get opposite asset state
-        if pred.opposite_asset_id and pred.opposite_asset_id in asset_books:
-            opp_book = asset_books[pred.opposite_asset_id]
-            opp_best_bid = opp_book.get("best_bid", 0.0)
+        if pred.maker_fill_price is not None:
+            # Success profit mirrors add_final_profit_labels: use our posted
+            # quote price, while trade evidence only proves the quote was
+            # marketable/fillable within the horizon.
+            profit = success_revenue - success_total_cost
+            self.stats.total_success += 1
+            self.stats.recent_profits.append(profit)
+            self.stats.total_profit += profit
+            self.stats.total_resolved += 1
+            return {
+                "result": "success",
+                "profit": profit,
+                "first_leg_price": first_leg_price,
+                "fee_per_share": fee_per_share,
+                "second_leg_size": second_leg_size,
+                "second_leg_quote": second_leg_price,
+                "second_leg_fill_price": pred.maker_fill_price,
+                "second_leg_fill_lag_ms": (pred.maker_fill_ns - pred.predict_ns) / NS_PER_MS
+                if pred.maker_fill_ns is not None
+                else None,
+                "success_revenue": success_revenue,
+                "first_leg_cost": success_first_leg_cost,
+                "second_leg_cost": success_second_leg_cost,
+                "total_cost": success_total_cost,
+                "future_best_bid": future_best_bid,
+                "future_best_ask": future_best_ask,
+                "future_mid": future_mid,
+            }
 
-            # Check if two-leg would have succeeded
-            # If opposite asset's best_bid is high enough that our total <= max_total_price
-            total_price = entry_price + opp_best_bid
-
-            if total_price <= pred.two_leg_max_total_price:
-                # Success: both legs fill
-                # cost = first_leg_price + second_leg_size * second_leg_price
-                # revenue = second_leg_size (both legs pay $1/share at expiry)
-                # profit = revenue - cost = second_leg_size - (first_leg_price + second_leg_size * second_leg_price)
-                profit = second_leg_size - (first_leg_price + second_leg_size * second_leg_price)
-                self.stats.total_success += 1
-                self.stats.recent_profits.append(profit)
-                self.stats.total_profit += profit
-                self.stats.total_resolved += 1
-                return profit, "success"
-            else:
-                # Unwind: sell second_leg_size shares at future best_bid
-                # loss = first_leg_price - second_leg_size * future_best_bid
-                unwind_loss = max(0.0, first_leg_price - second_leg_size * future_best_bid)
-                profit = -unwind_loss
-                self.stats.total_failure += 1
-                self.stats.recent_profits.append(profit)
-                self.stats.total_profit += profit
-                self.stats.total_resolved += 1
-                return profit, "unwind"
-        else:
-            # No opposite asset tracked → unwind with loss
-            unwind_loss = max(0.0, first_leg_price - second_leg_size * future_best_bid)
-            profit = -unwind_loss
+        # No fill evidence: unwind the first leg at future same-leg best_bid.
+        # This is signed PnL, so a favorable first-leg move can still be
+        # profitable even when the maker exit never fills.
+        unwind_revenue = second_leg_size * future_best_bid
+        profit = unwind_revenue - first_leg_price
+        result = "unwind" if pred.opposite_asset_id else "no_opposite"
+        if pred.opposite_asset_id:
             self.stats.total_failure += 1
             self.stats.recent_profits.append(profit)
             self.stats.total_profit += profit
             self.stats.total_resolved += 1
-            return profit, "no_opposite"
+            return {
+                "result": result,
+                "profit": profit,
+                "first_leg_price": first_leg_price,
+                "fee_per_share": fee_per_share,
+                "second_leg_size": second_leg_size,
+                "second_leg_quote": second_leg_price,
+                "second_leg_fill_price": None,
+                "second_leg_fill_lag_ms": None,
+                "unwind_revenue": unwind_revenue,
+                "unwind_price": future_best_bid,
+                "unwind_price_move": future_best_bid - first_leg_price,
+                "first_leg_cost": first_leg_price,
+                "future_best_bid": future_best_bid,
+                "future_best_ask": future_best_ask,
+                "future_mid": future_mid,
+            }
+
+        self.stats.total_failure += 1
+        self.stats.recent_profits.append(profit)
+        self.stats.total_profit += profit
+        self.stats.total_resolved += 1
+        return {
+            "result": result,
+            "profit": profit,
+            "first_leg_price": first_leg_price,
+            "fee_per_share": fee_per_share,
+            "second_leg_size": second_leg_size,
+            "second_leg_quote": second_leg_price,
+            "second_leg_fill_price": None,
+            "second_leg_fill_lag_ms": None,
+            "unwind_revenue": unwind_revenue,
+            "unwind_price": future_best_bid,
+            "unwind_price_move": future_best_bid - first_leg_price,
+            "first_leg_cost": first_leg_price,
+            "future_best_bid": future_best_bid,
+            "future_best_ask": future_best_ask,
+            "future_mid": future_mid,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -448,21 +590,49 @@ class PredictionPipeline:
     def __init__(
         self,
         model_path: str | Path,
+        unwind_model_path: str | Path | None = None,
         threshold: float = 0.6,
+        min_p_fill: float = 0.0,
+        min_pred_unwind_profit: float = -1.0,
         sample_interval_ms: int = 100,
         horizon_seconds: int = 10,
         fee_rate: float = 0.072,
         price_buffer: float = 0.01,
+        signal_cooldown_seconds: float | None = None,
+        log_near_threshold: bool = False,
+        stats_interval: int = 1000,
+        min_entry_ask: float = 0.05,
+        max_entry_ask: float = 0.95,
+        min_time_to_expiry_seconds: float = 20.0,
+        max_spread: float = 0.05,
+        max_entries_per_signal_key: int = 0,
     ):
         self.threshold = threshold
+        self.min_p_fill = min_p_fill
+        self.min_pred_unwind_profit = min_pred_unwind_profit
         self.sample_interval_ns = sample_interval_ms * NS_PER_MS
         self.horizon_seconds = horizon_seconds
         self.fee_rate = fee_rate
         self.price_buffer = price_buffer
+        self.signal_cooldown_ns = int((signal_cooldown_seconds if signal_cooldown_seconds is not None else horizon_seconds) * NS_PER_SECOND)
+        self.log_near_threshold = log_near_threshold
+        self.stats_interval = max(1, stats_interval)
+        self.min_entry_ask = min_entry_ask
+        self.max_entry_ask = max_entry_ask
+        self.min_time_to_expiry_seconds = min_time_to_expiry_seconds
+        self.max_spread = max_spread
+        self.max_entries_per_signal_key = max(0, int(max_entries_per_signal_key))
 
-        # Load model
+        # Load model. In two-stage mode, model_path is the fill classifier and
+        # unwind_model_path is a signed-PnL regressor for the failure branch.
         blob = joblib.load(str(model_path))
         self.pipeline = blob["model"]
+        self.unwind_pipeline = None
+        unwind_feature_cols: list[str] = []
+        if unwind_model_path is not None:
+            unwind_blob = joblib.load(str(unwind_model_path))
+            self.unwind_pipeline = unwind_blob["model"]
+            unwind_feature_cols = unwind_blob.get("feature_columns", [])
         model_feature_cols = blob.get("feature_columns", [])
 
         # Load training metadata for feature column order
@@ -477,6 +647,11 @@ class PredictionPipeline:
             self.cat_columns = [c for c in model_feature_cols if "bucket" in c]
         else:
             raise ValueError("Cannot determine feature columns from model or metadata")
+        for col in unwind_feature_cols:
+            if col not in self.feature_columns:
+                self.feature_columns.append(col)
+        self.model_feature_columns = model_feature_cols or self.feature_columns
+        self.unwind_feature_columns = unwind_feature_cols or self.feature_columns
 
         self.assembler = LiveFeatureAssembler(self.feature_columns, self.cat_columns)
         self.monitor = OutcomeMonitor(horizon_seconds, fee_rate, price_buffer)
@@ -493,6 +668,12 @@ class PredictionPipeline:
 
         self._running = False
         self._signal_count_since_display = 0
+        self._last_proba_by_asset: dict[str, float] = {}
+        self._last_signal_ns_by_key: dict[str, int] = {}
+        self._signal_count_by_key: dict[str, int] = {}
+        self._next_signal_id = 1
+        self._score_window: deque[dict[str, float | None]] = deque(maxlen=10_000)
+        self._block_counts: Counter[str] = Counter()
 
     def _get_or_create_asset(self, asset_id: str) -> AssetState:
         if asset_id not in self.asset_states:
@@ -513,8 +694,8 @@ class PredictionPipeline:
             ids = list(assets.keys())
             self.opposite_map[ids[0]] = ids[1]
             self.opposite_map[ids[1]] = ids[0]
-            self.asset_states.get(ids[0], AssetState(asset_id=ids[0])).opposite_asset_id = ids[1]
-            self.asset_states.get(ids[1], AssetState(asset_id=ids[1])).opposite_asset_id = ids[0]
+            self._get_or_create_asset(ids[0]).opposite_asset_id = ids[1]
+            self._get_or_create_asset(ids[1]).opposite_asset_id = ids[0]
 
     def handle_poly_book(self, asset_id: str, features: dict, recv_ns: int, metadata: dict | None = None) -> None:
         """Process a poly orderbook update and potentially run prediction."""
@@ -567,6 +748,7 @@ class PredictionPipeline:
 
     def handle_poly_trade(self, asset_id: str, side: str, price: float, size: float, recv_ns: int) -> None:
         """Process a poly trade."""
+        self.monitor.observe_trade(asset_id, side, price, recv_ns)
         asset = self._get_or_create_asset(asset_id)
         signed_side = 1.0 if side.upper() in ("BUY", "BID") else -1.0
         asset.trades_100ms.add(recv_ns, 1.0)
@@ -616,48 +798,169 @@ class PredictionPipeline:
                 row[col] = 0.0 if col not in self.cat_columns else "unknown"
             else:
                 row[col] = val
-        df = pd.DataFrame([row])[self.feature_columns]
+        df = pd.DataFrame([row])
 
         # Predict
-        proba = self.pipeline.predict_proba(df)[0, 1]
+        proba = self.pipeline.predict_proba(df[self.model_feature_columns])[0, 1]
+        pred_unwind_profit = None
+        pred_expected_profit = None
+        decision_score = proba
+        if self.unwind_pipeline is not None:
+            pred_unwind_profit = float(self.unwind_pipeline.predict(df[self.unwind_feature_columns])[0])
+
+        if asset.opposite_asset_id is None and asset.asset_id in self.opposite_map:
+            asset.opposite_asset_id = self.opposite_map[asset.asset_id]
 
         # Output
         tte = (asset.expiry_ns - recv_ns) / NS_PER_SECOND if asset.expiry_ns > 0 else 0
         slug_short = asset.slug.split("-updown-")[-1] if "-updown-" in asset.slug else asset.slug[:20]
         outcome_char = "U" if asset.outcome == "Up" else "D" if asset.outcome == "Down" else "?"
 
-        signal = proba >= self.threshold
-        signal_str = "** SIGNAL **" if signal else ""
+        prev_score = self._last_proba_by_asset.get(asset.asset_id)
+        second_leg_quote_price = 0.96 - asset.best_ask
+        first_leg_price = asset.best_ask + self.price_buffer
+        fee_per_share = self.fee_rate * first_leg_price * (1.0 - first_leg_price)
+        second_leg_size = 1.0 - fee_per_share
+        success_profit_estimate = second_leg_size - (
+            first_leg_price + second_leg_size * second_leg_quote_price
+        )
+        if pred_unwind_profit is not None:
+            pred_expected_profit = proba * success_profit_estimate + (1.0 - proba) * pred_unwind_profit
+            decision_score = pred_expected_profit
 
-        if signal or proba > self.threshold * 0.8:
+        raw_signal = decision_score >= self.threshold
+        if self.unwind_pipeline is not None:
+            # The offline two-stage execution policy selects rows that satisfy
+            # the full policy, then applies cooldown/max-entry gates. It does
+            # not require a raw score threshold crossing, because p_fill,
+            # expected profit, and unwind risk can become eligible at different
+            # times. Keep live semantics aligned with that evaluator.
+            crossed_threshold = True
+        else:
+            crossed_threshold = prev_score is None or prev_score < self.threshold
+        market_key = asset.market_id or asset.slug or asset.asset_id
+        signal_key = f"{market_key}:{asset.outcome or asset.asset_id}"
+        last_signal_ns = self._last_signal_ns_by_key.get(signal_key, 0)
+        cooldown_ok = recv_ns - last_signal_ns >= self.signal_cooldown_ns
+        max_entries_ok = (
+            self.max_entries_per_signal_key == 0
+            or self._signal_count_by_key.get(signal_key, 0) < self.max_entries_per_signal_key
+        )
+        has_opposite = asset.opposite_asset_id is not None
+        structural_entry_filter_ok = (
+            self.min_entry_ask <= asset.best_ask <= self.max_entry_ask
+            and tte >= self.min_time_to_expiry_seconds
+            and asset.current_spread <= self.max_spread
+            and asset.best_bid > 0
+            and asset.best_ask > 0
+        )
+        p_fill_ok = proba >= self.min_p_fill
+        unwind_ok = pred_unwind_profit is None or pred_unwind_profit >= self.min_pred_unwind_profit
+        signal = (
+            raw_signal
+            and crossed_threshold
+            and cooldown_ok
+            and max_entries_ok
+            and has_opposite
+            and structural_entry_filter_ok
+            and p_fill_ok
+            and unwind_ok
+        )
+        self._score_window.append(
+            {
+                "p_fill": float(proba),
+                "pred_unwind_profit": pred_unwind_profit,
+                "pred_expected_profit": pred_expected_profit,
+                "decision_score": float(decision_score),
+            }
+        )
+        self._record_gate_counts(
+            raw_signal=raw_signal,
+            crossed_threshold=crossed_threshold,
+            cooldown_ok=cooldown_ok,
+            max_entries_ok=max_entries_ok,
+            has_opposite=has_opposite,
+            entry_filter_ok=structural_entry_filter_ok,
+            p_fill_ok=p_fill_ok,
+            unwind_ok=unwind_ok,
+            signal=signal,
+        )
+        self._last_proba_by_asset[asset.asset_id] = decision_score
+        if (not signal) and self.log_near_threshold and decision_score > self.threshold * 0.8:
             logger.info(
-                "predict",
-                asset=asset.asset_id[:8],
+                "prediction_near_threshold",
+                asset=short_id(asset.asset_id),
                 slug=slug_short,
                 outcome=outcome_char,
                 mid=f"{asset.current_mid:.3f}",
                 ask=f"{asset.best_ask:.3f}",
                 proba=f"{proba:.3f}",
+                decision_score=f"{decision_score:.6f}",
                 tte=f"{tte:.0f}s",
-                signal=signal_str,
             )
 
         if signal:
+            signal_seq_for_key = self._signal_count_by_key.get(signal_key, 0) + 1
+            signal_id = f"S{self._next_signal_id:06d}"
+            self._next_signal_id += 1
             pred = PendingPrediction(
+                signal_id=signal_id,
                 predict_ns=recv_ns,
                 asset_id=asset.asset_id,
                 market_id=asset.market_id,
                 outcome=asset.outcome,
+                signal_key=signal_key,
+                signal_seq_for_key=signal_seq_for_key,
+                best_bid_at_entry=asset.best_bid,
                 best_ask_at_entry=asset.best_ask,
                 current_mid_at_entry=asset.current_mid,
+                spread_at_entry=asset.current_spread,
+                time_to_expiry_at_entry=tte,
                 proba=proba,
+                pred_unwind_profit=pred_unwind_profit,
+                pred_expected_profit=pred_expected_profit,
+                decision_score=decision_score,
                 opposite_asset_id=asset.opposite_asset_id,
                 slug=asset.slug,
                 fee_rate=self.fee_rate,
                 price_buffer=self.price_buffer,
+                second_leg_quote_price=second_leg_quote_price,
             )
             self.monitor.add_signal(pred)
+            self._last_signal_ns_by_key[signal_key] = recv_ns
+            self._signal_count_by_key[signal_key] = signal_seq_for_key
             self._signal_count_since_display += 1
+            logger.info(
+                "signal_open",
+                signal_id=signal_id,
+                signal_key=signal_key,
+                signal_seq_for_key=signal_seq_for_key,
+                max_entries_per_signal_key=self.max_entries_per_signal_key,
+                slug=slug_short,
+                market_id=short_id(asset.market_id, 12),
+                outcome=asset.outcome,
+                asset=short_id(asset.asset_id),
+                opposite_asset=short_id(asset.opposite_asset_id),
+                proba=f"{proba:.6f}",
+                threshold=f"{self.threshold:.6f}",
+                decision_score=f"{decision_score:.6f}",
+                p_fill=f"{proba:.6f}",
+                min_p_fill=f"{self.min_p_fill:.6f}",
+                pred_unwind_profit=fmt_float(pred_unwind_profit),
+                min_pred_unwind_profit=fmt_float(self.min_pred_unwind_profit),
+                pred_expected_profit=fmt_float(pred_expected_profit),
+                entry_bid=fmt_price(asset.best_bid),
+                entry_ask=fmt_price(asset.best_ask),
+                entry_mid=fmt_price(asset.current_mid),
+                spread=fmt_price(asset.current_spread),
+                tte_seconds=f"{tte:.1f}",
+                first_leg_price=fmt_price(first_leg_price),
+                price_buffer=fmt_price(self.price_buffer),
+                fee_per_share=fmt_float(fee_per_share),
+                second_leg_size=fmt_float(second_leg_size),
+                second_leg_quote=fmt_price(second_leg_quote_price),
+                success_profit_estimate=f"{success_profit_estimate:+.6f}",
+            )
 
         # Check outcomes for pending predictions
         asset_books = {}
@@ -668,21 +971,55 @@ class PredictionPipeline:
                 "current_mid": state.current_mid,
             }
         resolved = self.monitor.check_outcomes(recv_ns, asset_books)
-        for pred, profit, outcome in resolved:
+        for pred, details in resolved:
+            profit = float(details["profit"])
+            result = str(details["result"])
             logger.info(
-                "outcome",
-                asset=pred.asset_id[:8],
-                slug=pred.slug.split("-updown-")[-1] if "-updown-" in pred.slug else pred.slug[:20],
+                "signal_close",
+                signal_id=pred.signal_id,
+                signal_key=pred.signal_key,
+                signal_seq_for_key=pred.signal_seq_for_key,
+                slug=short_slug(pred.slug),
+                market_id=short_id(pred.market_id, 12),
                 outcome_pred=pred.outcome,
-                entry_ask=f"{pred.best_ask_at_entry:.3f}",
-                proba=f"{pred.proba:.3f}",
-                result=outcome,
-                profit=f"{profit:+.4f}",
+                asset=short_id(pred.asset_id),
+                opposite_asset=short_id(pred.opposite_asset_id),
+                proba=f"{pred.proba:.6f}",
+                decision_score=fmt_float(pred.decision_score),
+                p_fill=f"{pred.proba:.6f}",
+                pred_unwind_profit=fmt_float(pred.pred_unwind_profit),
+                pred_expected_profit=fmt_float(pred.pred_expected_profit),
+                result=result,
+                profit=f"{profit:+.6f}",
+                entry_bid=fmt_price(pred.best_bid_at_entry),
+                entry_ask=fmt_price(pred.best_ask_at_entry),
+                entry_mid=fmt_price(pred.current_mid_at_entry),
+                entry_spread=fmt_price(pred.spread_at_entry),
+                entry_tte_seconds=f"{pred.time_to_expiry_at_entry:.1f}",
+                first_leg_price=fmt_price(float(details["first_leg_price"])),
+                fee_per_share=fmt_float(float(details["fee_per_share"])),
+                second_leg_size=fmt_float(float(details["second_leg_size"])),
+                second_leg_quote=fmt_price(float(details["second_leg_quote"])),
+                second_leg_fill_price=fmt_price(details.get("second_leg_fill_price")),
+                second_leg_fill_lag_ms=(
+                    "" if details.get("second_leg_fill_lag_ms") is None else f"{float(details['second_leg_fill_lag_ms']):.0f}"
+                ),
+                future_best_bid=fmt_price(float(details["future_best_bid"])),
+                future_best_ask=fmt_price(float(details["future_best_ask"])),
+                future_mid=fmt_price(float(details["future_mid"])),
+                unwind_revenue=fmt_float(details.get("unwind_revenue")),
+                unwind_price=fmt_price(details.get("unwind_price")),
+                unwind_price_move=fmt_price(details.get("unwind_price_move")),
+                success_revenue=fmt_float(details.get("success_revenue")),
+                first_leg_cost=fmt_float(details.get("first_leg_cost")),
+                second_leg_cost=fmt_float(details.get("second_leg_cost")),
+                total_cost=fmt_float(details.get("total_cost")),
                 running=self.monitor.stats.summary(),
             )
 
         # Periodic stats display
-        if self.monitor.stats.total_predictions % 100 == 0:
+        if self.monitor.stats.total_predictions % self.stats_interval == 0:
+            score_stats = self._score_stats()
             logger.info(
                 "stats",
                 predictions=self.monitor.stats.total_predictions,
@@ -691,4 +1028,57 @@ class PredictionPipeline:
                 resolved=self.monitor.stats.total_resolved,
                 accuracy=f"{self.monitor.stats.accuracy():.1%}",
                 total_profit=f"{self.monitor.stats.total_profit:+.4f}",
+                score_stats=score_stats,
+                gate_counts=dict(self._block_counts),
             )
+            self._block_counts.clear()
+
+    def _record_gate_counts(
+        self,
+        *,
+        raw_signal: bool,
+        crossed_threshold: bool,
+        cooldown_ok: bool,
+        max_entries_ok: bool,
+        has_opposite: bool,
+        entry_filter_ok: bool,
+        p_fill_ok: bool,
+        unwind_ok: bool,
+        signal: bool,
+    ) -> None:
+        self._block_counts["samples"] += 1
+        if signal:
+            self._block_counts["signals"] += 1
+            return
+        if not raw_signal:
+            self._block_counts["blocked_threshold"] += 1
+        if not p_fill_ok:
+            self._block_counts["blocked_p_fill"] += 1
+        if not unwind_ok:
+            self._block_counts["blocked_unwind"] += 1
+        if not crossed_threshold:
+            self._block_counts["blocked_crossing"] += 1
+        if not cooldown_ok:
+            self._block_counts["blocked_cooldown"] += 1
+        if not max_entries_ok:
+            self._block_counts["blocked_max_entries"] += 1
+        if not has_opposite:
+            self._block_counts["blocked_no_opposite"] += 1
+        if not entry_filter_ok:
+            self._block_counts["blocked_entry_filter"] += 1
+
+    def _score_stats(self) -> dict[str, object]:
+        rows = list(self._score_window)
+        return {
+            "window": len(rows),
+            "p_fill": quantile_summary([float(r["p_fill"]) for r in rows if r.get("p_fill") is not None]),
+            "pred_unwind_profit": quantile_summary(
+                [float(r["pred_unwind_profit"]) for r in rows if r.get("pred_unwind_profit") is not None]
+            ),
+            "pred_expected_profit": quantile_summary(
+                [float(r["pred_expected_profit"]) for r in rows if r.get("pred_expected_profit") is not None]
+            ),
+            "decision_score": quantile_summary(
+                [float(r["decision_score"]) for r in rows if r.get("decision_score") is not None]
+            ),
+        }

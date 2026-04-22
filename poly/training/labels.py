@@ -194,13 +194,14 @@ def add_final_profit_labels(
         success_profit  = second_leg_size - (first_leg_price + second_leg_size * second_leg_price)
 
     Failure (unwind first leg):
-        unwind_loss = first_leg_price - second_leg_size * future_best_bid
-        failure_profit = -unwind_loss
+        unwind_profit = second_leg_size * future_best_bid - first_leg_price
+        unwind_loss = -unwind_profit
     """
     future_mid_col = f"future_mid_{horizon_seconds}s"
     future_bid_col = f"future_best_bid_{horizon_seconds}s"
     two_leg_cls_col = f"y_two_leg_entry_{horizon_seconds}s"
     unwind_loss_col = f"first_unwind_loss_proxy_{horizon_seconds}s"
+    unwind_profit_col = f"first_unwind_profit_proxy_{horizon_seconds}s"
     final_profit_col = f"final_profit_{horizon_seconds}s"
     final_profit_weight_col = f"final_profit_weight_{horizon_seconds}s"
     cls_col = f"y_final_profit_entry_{horizon_seconds}s"
@@ -215,17 +216,22 @@ def add_final_profit_labels(
     # Success profit (per share): revenue - cost = second_leg_size - (first_leg_price + second_leg_size * second_leg_price)
     success_profit = second_leg_size - (first_leg_price + second_leg_size * second_leg_price)
 
-    # Unwind loss: bought at first_leg_price, sell back at future bid, but only own second_leg_size shares
+    # Unwind PnL for the first-leg failure branch:
+    # buy one share at first_leg_price, then sell the remaining post-fee
+    # share quantity at the future same-leg best bid. This can be positive
+    # when the first leg moves favorably even if the maker exit never fills.
     unwind_reference = pl.col(future_bid_col) if future_bid_col in samples.columns else pl.col(future_mid_col)
-    unwind_loss = (first_leg_price - second_leg_size * unwind_reference).clip(0, None)
+    unwind_profit = second_leg_size * unwind_reference - first_leg_price
+    unwind_loss = -unwind_profit
 
     final_profit = (
         pl.when(pl.col(two_leg_cls_col) == "enter")
         .then(success_profit)
-        .otherwise(-unwind_loss)
+        .otherwise(unwind_profit)
     )
     return (
         samples.with_columns(unwind_loss.alias(unwind_loss_col))
+        .with_columns(unwind_profit.alias(unwind_profit_col))
         .with_columns(final_profit.alias(final_profit_col))
         .with_columns(
             [

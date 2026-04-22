@@ -31,7 +31,7 @@ class TrainedArtifacts:
 def train_baselines(config: TrainConfig) -> TrainedArtifacts:
     ensure_sklearn()
     from sklearn.compose import ColumnTransformer
-    from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+    from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, RandomForestClassifier, RandomForestRegressor
     from sklearn.impute import SimpleImputer
     from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
     from sklearn.naive_bayes import GaussianNB
@@ -122,6 +122,24 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
                 ]
             ),
         ),
+        "random_forest_regressor": (
+            "regression",
+            Pipeline(
+                [
+                    ("prep", tree_preprocessor),
+                    (
+                        "model",
+                        RandomForestRegressor(
+                            n_estimators=100,
+                            max_depth=8,
+                            min_samples_leaf=50,
+                            n_jobs=-1,
+                            random_state=config.random_seed,
+                        ),
+                    ),
+                ]
+            ),
+        ),
         "extra_trees_classifier": (
             "classification",
             Pipeline(
@@ -134,6 +152,24 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
                             max_depth=8,
                             min_samples_leaf=50,
                             class_weight="balanced",
+                            n_jobs=-1,
+                            random_state=config.random_seed,
+                        ),
+                    ),
+                ]
+            ),
+        ),
+        "extra_trees_regressor": (
+            "regression",
+            Pipeline(
+                [
+                    ("prep", tree_preprocessor),
+                    (
+                        "model",
+                        ExtraTreesRegressor(
+                            n_estimators=100,
+                            max_depth=8,
+                            min_samples_leaf=50,
                             n_jobs=-1,
                             random_state=config.random_seed,
                         ),
