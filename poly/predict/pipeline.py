@@ -913,7 +913,11 @@ class PredictionPipeline:
             return
         asset.last_sample_ns = recv_ns
 
-        # Assemble features and predict
+        # Outcome checks only need current books; keep them independent from
+        # model gating so pending signals still resolve when we skip inference.
+        self._check_pending_outcomes(recv_ns)
+
+        # Assemble features and predict when pre-model gates say it can matter.
         self._predict(asset, recv_ns)
 
     def handle_poly_trade(self, asset_id: str, side: str, price: float, size: float, recv_ns: int) -> None:
@@ -955,7 +959,37 @@ class PredictionPipeline:
         if asset.current_mid <= 0:
             return
 
-        self.monitor.stats.total_predictions += 1
+        if asset.opposite_asset_id is None and asset.asset_id in self.opposite_map:
+            asset.opposite_asset_id = self.opposite_map[asset.asset_id]
+
+        tte = (asset.expiry_ns - recv_ns) / NS_PER_SECOND if asset.expiry_ns > 0 else 0
+        slug_short = asset.slug.split("-updown-")[-1] if "-updown-" in asset.slug else asset.slug[:20]
+        outcome_char = "U" if asset.outcome == "Up" else "D" if asset.outcome == "Down" else "?"
+        market_key = asset.market_id or asset.slug or asset.asset_id
+        signal_key = f"{market_key}:{asset.outcome or asset.asset_id}"
+        last_signal_ns = self._last_signal_ns_by_key.get(signal_key, 0)
+        cooldown_ok = recv_ns - last_signal_ns >= self.signal_cooldown_ns
+        max_entries_ok = (
+            self.max_entries_per_signal_key == 0
+            or self._signal_count_by_key.get(signal_key, 0) < self.max_entries_per_signal_key
+        )
+        has_opposite = asset.opposite_asset_id is not None
+        structural_entry_filter_ok = (
+            self.min_entry_ask <= asset.best_ask <= self.max_entry_ask
+            and tte >= self.min_time_to_expiry_seconds
+            and asset.current_spread <= self.max_spread
+            and asset.best_bid > 0
+            and asset.best_ask > 0
+        )
+
+        if not (cooldown_ok and max_entries_ok and has_opposite and structural_entry_filter_ok):
+            self._record_pre_model_skip(
+                cooldown_ok=cooldown_ok,
+                max_entries_ok=max_entries_ok,
+                has_opposite=has_opposite,
+                entry_filter_ok=structural_entry_filter_ok,
+            )
+            return
 
         # Assemble features
         feat_dict = self.assembler.assemble(asset, self.binance_state)
@@ -971,20 +1005,13 @@ class PredictionPipeline:
         df = pd.DataFrame([row])
 
         # Predict
+        self.monitor.stats.total_predictions += 1
         proba = self.pipeline.predict_proba(df[self.model_feature_columns])[0, 1]
         pred_unwind_profit = None
         pred_expected_profit = None
         decision_score = proba
         if self.unwind_pipeline is not None:
             pred_unwind_profit = float(self.unwind_pipeline.predict(df[self.unwind_feature_columns])[0])
-
-        if asset.opposite_asset_id is None and asset.asset_id in self.opposite_map:
-            asset.opposite_asset_id = self.opposite_map[asset.asset_id]
-
-        # Output
-        tte = (asset.expiry_ns - recv_ns) / NS_PER_SECOND if asset.expiry_ns > 0 else 0
-        slug_short = asset.slug.split("-updown-")[-1] if "-updown-" in asset.slug else asset.slug[:20]
-        outcome_char = "U" if asset.outcome == "Up" else "D" if asset.outcome == "Down" else "?"
 
         prev_score = self._last_proba_by_asset.get(asset.asset_id)
         second_leg_quote_price = 0.96 - asset.best_ask
@@ -1008,22 +1035,6 @@ class PredictionPipeline:
             crossed_threshold = True
         else:
             crossed_threshold = prev_score is None or prev_score < self.threshold
-        market_key = asset.market_id or asset.slug or asset.asset_id
-        signal_key = f"{market_key}:{asset.outcome or asset.asset_id}"
-        last_signal_ns = self._last_signal_ns_by_key.get(signal_key, 0)
-        cooldown_ok = recv_ns - last_signal_ns >= self.signal_cooldown_ns
-        max_entries_ok = (
-            self.max_entries_per_signal_key == 0
-            or self._signal_count_by_key.get(signal_key, 0) < self.max_entries_per_signal_key
-        )
-        has_opposite = asset.opposite_asset_id is not None
-        structural_entry_filter_ok = (
-            self.min_entry_ask <= asset.best_ask <= self.max_entry_ask
-            and tte >= self.min_time_to_expiry_seconds
-            and asset.current_spread <= self.max_spread
-            and asset.best_bid > 0
-            and asset.best_ask > 0
-        )
         p_fill_ok = proba >= self.min_p_fill
         unwind_ok = pred_unwind_profit is None or pred_unwind_profit >= self.min_pred_unwind_profit
         signal = (
@@ -1134,7 +1145,10 @@ class PredictionPipeline:
                 success_profit_estimate=f"{success_profit_estimate:+.6f}",
             )
 
-        # Check outcomes for pending predictions
+        self._maybe_log_stats()
+
+    def _check_pending_outcomes(self, recv_ns: int) -> None:
+        """Resolve pending predictions using the latest books."""
         asset_books = {}
         for aid, state in self.asset_states.items():
             asset_books[aid] = {
@@ -1190,6 +1204,7 @@ class PredictionPipeline:
             )
             self._write_signal_resolved_sample(pred, details, recv_ns)
 
+    def _maybe_log_stats(self) -> None:
         # Periodic stats display
         if self.monitor.stats.total_predictions % self.stats_interval == 0:
             score_stats = self._score_stats()
@@ -1205,6 +1220,25 @@ class PredictionPipeline:
                 gate_counts=dict(self._block_counts),
             )
             self._block_counts.clear()
+
+    def _record_pre_model_skip(
+        self,
+        *,
+        cooldown_ok: bool,
+        max_entries_ok: bool,
+        has_opposite: bool,
+        entry_filter_ok: bool,
+    ) -> None:
+        self._block_counts["samples"] += 1
+        self._block_counts["pre_model_skips"] += 1
+        if not cooldown_ok:
+            self._block_counts["blocked_cooldown"] += 1
+        if not max_entries_ok:
+            self._block_counts["blocked_max_entries"] += 1
+        if not has_opposite:
+            self._block_counts["blocked_no_opposite"] += 1
+        if not entry_filter_ok:
+            self._block_counts["blocked_entry_filter"] += 1
 
     def _record_gate_counts(
         self,
