@@ -57,11 +57,12 @@ async def run_pipeline(
     signal_cooldown_seconds: float | None = None,
     log_near_threshold: bool = False,
     stats_interval: int = 1000,
-    min_entry_ask: float = 0.05,
-    max_entry_ask: float = 0.95,
+    min_entry_ask: float = 0.10,
+    max_entry_ask: float = 0.90,
     min_time_to_expiry: float = 20.0,
     max_spread: float = 0.05,
     max_entries_per_signal_key: int = 0,
+    signal_sample_path: str | Path | None = Path("logs/live_signal_samples.jsonl"),
 ) -> None:
     config = get_config()
 
@@ -100,6 +101,7 @@ async def run_pipeline(
         min_time_to_expiry_seconds=min_time_to_expiry,
         max_spread=max_spread,
         max_entries_per_signal_key=max_entries_per_signal_key,
+        signal_sample_path=signal_sample_path,
     )
     engine = OrderBookEngine()
 
@@ -124,6 +126,7 @@ async def run_pipeline(
         min_time_to_expiry=min_time_to_expiry,
         max_spread=max_spread,
         max_entries_per_signal_key=max_entries_per_signal_key,
+        signal_sample_path=str(signal_sample_path) if signal_sample_path else None,
     )
 
     shutdown_event = asyncio.Event()
@@ -421,11 +424,18 @@ async def _run_binance_ws(config, pipeline: PredictionPipeline, symbols: list[st
 )
 @click.option("--log-near-threshold", is_flag=True, help="Also log non-signal predictions near the threshold.")
 @click.option("--stats-interval", type=int, default=1000, show_default=True, help="Prediction count interval for stats logs.")
-@click.option("--min-entry-ask", type=float, default=0.05, show_default=True, help="Skip live signals below this first-leg ask.")
-@click.option("--max-entry-ask", type=float, default=0.95, show_default=True, help="Skip live signals above this first-leg ask.")
+@click.option("--min-entry-ask", type=float, default=0.10, show_default=True, help="Skip live signals below this first-leg ask.")
+@click.option("--max-entry-ask", type=float, default=0.90, show_default=True, help="Skip live signals above this first-leg ask.")
 @click.option("--min-time-to-expiry", type=float, default=20.0, show_default=True, help="Skip live signals with less time to expiry.")
 @click.option("--max-spread", type=float, default=0.05, show_default=True, help="Skip live signals when Polymarket spread is wider than this.")
 @click.option("--max-entries-per-signal-key", type=int, default=0, show_default=True, help="0 means unlimited; key is market/outcome.")
+@click.option(
+    "--signal-sample-path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=Path("logs/live_signal_samples.jsonl"),
+    show_default=True,
+    help="Append live signal features and resolved final-profit labels for offline replay checks.",
+)
 def main(
     model,
     model_dir,
@@ -449,6 +459,7 @@ def main(
     min_time_to_expiry,
     max_spread,
     max_entries_per_signal_key,
+    signal_sample_path,
 ):
     """Start live prediction pipeline with outcome monitoring."""
     asyncio.run(run_pipeline(
@@ -474,6 +485,7 @@ def main(
         min_time_to_expiry=min_time_to_expiry,
         max_spread=max_spread,
         max_entries_per_signal_key=max_entries_per_signal_key,
+        signal_sample_path=signal_sample_path,
     ))
 
 

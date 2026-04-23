@@ -9,6 +9,7 @@ import json
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -71,6 +72,44 @@ def quantile_summary(values: list[float]) -> dict[str, float | None]:
         "p90": float(qs[5]),
         "max": float(qs[6]),
     }
+
+
+def ns_to_utc_iso(ns: int) -> str:
+    return datetime.fromtimestamp(ns / NS_PER_SECOND, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def json_safe(value):
+    """Convert pandas/numpy values into strict JSON-friendly primitives."""
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return json_safe(value.item())
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if value is pd.NA:
+        return None
+    return value
+
+
+class SignalSampleWriter:
+    """Append online signal features and resolved labels for offline replay checks."""
+
+    def __init__(self, path: str | Path | None):
+        self.path = Path(path) if path else None
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, record: dict) -> None:
+        if self.path is None:
+            return
+        try:
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(json_safe(record), ensure_ascii=False, separators=(",", ":")))
+                f.write("\n")
+        except Exception as exc:
+            logger.warning("signal_sample_write_failed", path=str(self.path), error=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -160,8 +199,8 @@ class AssetState:
     opposite_asset_id: str | None = None
 
     # EWMA state for smoothed features (fast span=5, slow span=20)
-    realized_vol_ewma_fast: float | None = None
-    realized_vol_ewma_slow: float | None = None
+    realized_vol_short_ewma_fast: float | None = None
+    realized_vol_short_ewma_slow: float | None = None
     depth_top10_imbalance_ewma_fast: float | None = None
     depth_top10_imbalance_ewma_slow: float | None = None
     binance_return_1s_ewma_fast: float | None = None
@@ -327,14 +366,16 @@ class LiveFeatureAssembler:
 
         # --- EWMA features (incremental update on asset state) ---
         rv = features.get("realized_vol_short")
-        asset.realized_vol_ewma_fast = _ewma_update(asset.realized_vol_ewma_fast, rv, _EWMA_ALPHA_FAST)
-        asset.realized_vol_ewma_slow = _ewma_update(asset.realized_vol_ewma_slow, rv, _EWMA_ALPHA_SLOW)
-        features["realized_vol_ewma_fast"] = asset.realized_vol_ewma_fast
-        features["realized_vol_ewma_slow"] = asset.realized_vol_ewma_slow
-        if asset.realized_vol_ewma_fast is not None and asset.realized_vol_ewma_slow is not None:
-            features["realized_vol_ewma_diff"] = asset.realized_vol_ewma_fast - asset.realized_vol_ewma_slow
+        asset.realized_vol_short_ewma_fast = _ewma_update(asset.realized_vol_short_ewma_fast, rv, _EWMA_ALPHA_FAST)
+        asset.realized_vol_short_ewma_slow = _ewma_update(asset.realized_vol_short_ewma_slow, rv, _EWMA_ALPHA_SLOW)
+        features["realized_vol_short_ewma_fast"] = asset.realized_vol_short_ewma_fast
+        features["realized_vol_short_ewma_slow"] = asset.realized_vol_short_ewma_slow
+        if asset.realized_vol_short_ewma_fast is not None and asset.realized_vol_short_ewma_slow is not None:
+            features["realized_vol_short_ewma_diff"] = (
+                asset.realized_vol_short_ewma_fast - asset.realized_vol_short_ewma_slow
+            )
         else:
-            features["realized_vol_ewma_diff"] = None
+            features["realized_vol_short_ewma_diff"] = None
 
         d10i = asset.depth_features.get("depth_top10_imbalance")
         asset.depth_top10_imbalance_ewma_fast = _ewma_update(asset.depth_top10_imbalance_ewma_fast, d10i, _EWMA_ALPHA_FAST)
@@ -400,6 +441,7 @@ class PendingPrediction:
     decision_score: float | None = None
     opposite_asset_id: str | None = None
     slug: str = ""
+    feature_values: dict[str, object] = field(default_factory=dict)
     two_leg_max_total_price: float = 0.96
     fee_rate: float = 0.072
     price_buffer: float = 0.01
@@ -653,11 +695,12 @@ class PredictionPipeline:
         signal_cooldown_seconds: float | None = None,
         log_near_threshold: bool = False,
         stats_interval: int = 1000,
-        min_entry_ask: float = 0.05,
-        max_entry_ask: float = 0.95,
+        min_entry_ask: float = 0.10,
+        max_entry_ask: float = 0.90,
         min_time_to_expiry_seconds: float = 20.0,
         max_spread: float = 0.05,
         max_entries_per_signal_key: int = 0,
+        signal_sample_path: str | Path | None = "logs/live_signal_samples.jsonl",
     ):
         self.threshold = threshold
         self.min_p_fill = min_p_fill
@@ -674,6 +717,7 @@ class PredictionPipeline:
         self.min_time_to_expiry_seconds = min_time_to_expiry_seconds
         self.max_spread = max_spread
         self.max_entries_per_signal_key = max(0, int(max_entries_per_signal_key))
+        self.signal_samples = SignalSampleWriter(signal_sample_path)
 
         # Load model. In two-stage mode, model_path is the fill classifier and
         # unwind_model_path is a signed-PnL regressor for the failure branch.
@@ -748,6 +792,80 @@ class PredictionPipeline:
             self.opposite_map[ids[1]] = ids[0]
             self._get_or_create_asset(ids[0]).opposite_asset_id = ids[1]
             self._get_or_create_asset(ids[1]).opposite_asset_id = ids[0]
+
+    def _signal_sample_base(self, event: str, pred: PendingPrediction, ts_ns: int) -> dict[str, object]:
+        entry_price = pred.best_ask_at_entry
+        first_leg_price = entry_price + pred.price_buffer
+        fee_per_share = pred.fee_rate * first_leg_price * (1.0 - first_leg_price)
+        second_leg_size = 1.0 - fee_per_share
+        second_leg_quote = pred.second_leg_quote_price or (pred.two_leg_max_total_price - entry_price)
+        success_profit_estimate = second_leg_size - (first_leg_price + second_leg_size * second_leg_quote)
+        return {
+            "schema_version": 1,
+            "event": event,
+            "timestamp": ns_to_utc_iso(ts_ns),
+            "timestamp_ns": ts_ns,
+            "signal_id": pred.signal_id,
+            "signal_key": pred.signal_key,
+            "signal_seq_for_key": pred.signal_seq_for_key,
+            "market_id": pred.market_id,
+            "asset_id": pred.asset_id,
+            "opposite_asset_id": pred.opposite_asset_id,
+            "outcome": pred.outcome,
+            "slug": pred.slug,
+            "horizon_seconds": self.horizon_seconds,
+            "policy": {
+                "threshold": self.threshold,
+                "min_p_fill": self.min_p_fill,
+                "min_pred_unwind_profit": self.min_pred_unwind_profit,
+                "min_entry_ask": self.min_entry_ask,
+                "max_entry_ask": self.max_entry_ask,
+                "min_time_to_expiry_seconds": self.min_time_to_expiry_seconds,
+                "max_spread": self.max_spread,
+                "max_entries_per_signal_key": self.max_entries_per_signal_key,
+                "price_buffer": self.price_buffer,
+                "fee_rate": self.fee_rate,
+            },
+            "prediction": {
+                "p_fill": pred.proba,
+                "pred_unwind_profit": pred.pred_unwind_profit,
+                "pred_expected_profit": pred.pred_expected_profit,
+                "decision_score": pred.decision_score,
+            },
+            "entry": {
+                "best_bid": pred.best_bid_at_entry,
+                "best_ask": pred.best_ask_at_entry,
+                "current_mid": pred.current_mid_at_entry,
+                "spread": pred.spread_at_entry,
+                "time_to_expiry_seconds": pred.time_to_expiry_at_entry,
+                "first_leg_price": first_leg_price,
+                "fee_per_share": fee_per_share,
+                "second_leg_size": second_leg_size,
+                "second_leg_quote": second_leg_quote,
+                "success_profit_estimate": success_profit_estimate,
+            },
+            "features": pred.feature_values,
+        }
+
+    def _write_signal_open_sample(self, pred: PendingPrediction) -> None:
+        self.signal_samples.write(self._signal_sample_base("live_signal_open_sample", pred, pred.predict_ns))
+
+    def _write_signal_resolved_sample(
+        self,
+        pred: PendingPrediction,
+        details: dict[str, object],
+        resolve_ns: int,
+    ) -> None:
+        profit = float(details["profit"])
+        record = self._signal_sample_base("live_signal_resolved_sample", pred, resolve_ns)
+        record["labels"] = {
+            f"final_profit_{self.horizon_seconds}s": profit,
+            f"y_final_profit_entry_{self.horizon_seconds}s": "enter" if profit > 0 else "skip",
+            f"y_final_profit_entry_binary_{self.horizon_seconds}s": int(profit > 0),
+            f"y_two_leg_entry_{self.horizon_seconds}s": "enter" if details.get("result") == "success" else "skip",
+        }
+        record["outcome_detail"] = details
+        self.signal_samples.write(record)
 
     def handle_poly_book(self, asset_id: str, features: dict, recv_ns: int, metadata: dict | None = None) -> None:
         """Process a poly orderbook update and potentially run prediction."""
@@ -974,11 +1092,13 @@ class PredictionPipeline:
                 decision_score=decision_score,
                 opposite_asset_id=asset.opposite_asset_id,
                 slug=asset.slug,
+                feature_values=dict(row),
                 fee_rate=self.fee_rate,
                 price_buffer=self.price_buffer,
                 second_leg_quote_price=second_leg_quote_price,
             )
             self.monitor.add_signal(pred)
+            self._write_signal_open_sample(pred)
             self._last_signal_ns_by_key[signal_key] = recv_ns
             self._signal_count_by_key[signal_key] = signal_seq_for_key
             self._signal_count_since_display += 1
@@ -1068,6 +1188,7 @@ class PredictionPipeline:
                 total_cost=fmt_float(details.get("total_cost")),
                 running=self.monitor.stats.summary(),
             )
+            self._write_signal_resolved_sample(pred, details, recv_ns)
 
         # Periodic stats display
         if self.monitor.stats.total_predictions % self.stats_interval == 0:
