@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=Path, required=True, help="live_candidate_samples.jsonl")
     parser.add_argument("--signal-samples", type=Path, default=None, help="Optional live_signal_samples.jsonl")
+    parser.add_argument(
+        "--include-all-signal-samples",
+        action="store_true",
+        help="Do not align signal samples to the candidate sample time range.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -66,6 +71,15 @@ def as_float(value) -> float | None:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def as_int(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -179,6 +193,13 @@ def main() -> None:
     signal_samples = args.signal_samples or args.samples.with_name("live_signal_samples.jsonl")
     candidate_rows = load_jsonl(args.samples, "live_candidate_resolved_sample")
     signal_rows = load_jsonl(signal_samples, "live_signal_resolved_sample")
+    signal_since_ns = None
+    if candidate_rows and not args.include_all_signal_samples:
+        candidate_timestamps = [as_int(row.get("timestamp_ns")) for row in candidate_rows]
+        candidate_timestamps = [ts for ts in candidate_timestamps if ts is not None]
+        if candidate_timestamps:
+            signal_since_ns = min(candidate_timestamps)
+            signal_rows = [row for row in signal_rows if (as_int(row.get("timestamp_ns")) or 0) >= signal_since_ns]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     tables = {
@@ -203,6 +224,7 @@ def main() -> None:
         },
         "live_policy": {
             "path": str(signal_samples),
+            "signal_since_timestamp_ns": signal_since_ns,
             "signal_count": len(signal_rows),
             **summary_metrics(signal_rows),
         },
