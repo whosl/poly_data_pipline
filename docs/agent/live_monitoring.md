@@ -21,28 +21,32 @@ Last known facts:
 
 ## Current Online Model
 
-Latest live command (training_20260422 artifacts with EWMA + winsorize):
+Latest verified live command on Ireland uses `training_eventdriven_20260423` artifacts:
 
 ```text
+POLY_UPDOWN_MARKETS=btc-updown-5m \
 python scripts/live_predict.py \
-  --model-path artifacts/training_20260422/fill_models/random_forest_classifier.joblib \
-  --unwind-model-path artifacts/training_20260422/unwind_models/random_forest_regressor.joblib \
-  --threshold 0.005 \
-  --min-p-fill 0.7 \
-  --min-pred-unwind-profit 0.0 \
+  --model-path artifacts/training_eventdriven_20260423/fill_models/xgboost_classifier.joblib \
+  --unwind-model-path artifacts/training_eventdriven_20260423/unwind_models/extra_trees_regressor.joblib \
+  --threshold 0.025 \
+  --min-p-fill 0.5 \
+  --min-pred-unwind-profit -0.05 \
   --sample-interval 100 \
-  --horizon 10 \
-  --stats-interval 1000 \
-  --min-entry-ask 0.05 \
-  --max-entry-ask 0.95 \
-  --min-time-to-expiry 20 \
-  --max-spread 0.05 \
-  --symbols btcusdt
+  --min-entry-ask 0.10 \
+  --max-entry-ask 0.90 \
+  --signal-sample-path logs/live_signal_samples.jsonl \
+  --candidate-sample-path logs/live_candidate_samples.jsonl \
+  --candidate-sample-interval-ms 1000 \
+  --maker-fill-latency-ms 250 \
+  --maker-fill-trade-through-ticks 1.0
 ```
 
-Previous policy used `training_reprofit_20260420_21_5m` artifacts with `threshold=0.020, min_p_fill=0.85` but produced 0 signals because live p_fill max was ~0.74.
+Current market scope is BTC 5m only. Recent verification showed `new_market` events only for `btc-updown-5m-*`, with no `btc-updown-15m` in `/tmp/live_predict.log`.
 
-Best offline models (not yet deployed): XGBoost fill classifier (p>=0.7: 64.9% win, EV +0.0313) + ExtraTrees unwind regressor (rank_corr 0.201).
+Historical policy notes:
+
+- `training_reprofit_20260420_21_5m` with `threshold=0.020, min_p_fill=0.85` produced 0 signals because live p_fill max was ~0.74.
+- `training_20260422` RF+RF with `threshold=0.005, min_p_fill=0.7, min_pred_unwind_profit=0.0` produced 0 signals after 2000 predictions.
 
 ## Log Events
 
@@ -109,7 +113,21 @@ Do not interpret every unwind as a loss. A directionally favorable first-leg mov
 
 ## Recent Live Results
 
-Single-model XGBoost and RandomForest both looked good offline but lost money live.
+### Event-Driven XGBoost+ExtraTrees (training_eventdriven_20260423)
+
+Parsed from Ireland `/tmp/live_predict.log`:
+
+| Window | Profitable | Success Path | Total Profit | Avg Profit |
+| --- | ---: | ---: | ---: | ---: |
+| first 23 resolved | 19/23 = 82.6% | 17/23 = 73.9% | `+0.1848` | `+0.0080` |
+| first 30 resolved | 25/30 = 83.3% | 23/30 = 76.7% | `+0.2611` | `+0.0087` |
+| first 33 resolved | 28/33 = 84.8% | 26/33 = 78.8% | `+0.3355` | `+0.0102` |
+
+This is promising but still a small live-shadow sample.
+
+### Earlier Live Runs
+
+Single-model XGBoost and RandomForest looked good offline but lost money live.
 
 Observed live failure pattern:
 
@@ -186,4 +204,4 @@ PY
 
 ## Main Risk
 
-Offline/live calibration is currently poor. The next improvement should compare live `signal_open` rows against offline labels at the same timestamps and identify why live maker fills are missing.
+The latest event-driven live-shadow run is positive so far, but calibration is not proven. Keep collecting resolved `live_candidate_samples.jsonl`, run `scripts/analyze_live_calibration.py`, and compare live outcomes against offline labels at the same market/asset/timestamp.

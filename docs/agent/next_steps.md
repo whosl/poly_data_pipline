@@ -14,7 +14,7 @@ Focus on:
 - unwind tail misses
 - score distribution drift between offline validation and live
 
-The training_20260422 two-stage RF+RF model showed live p_fill max 0.638 vs offline 0.7+ threshold. This distribution shift must be understood before tuning thresholds further.
+The latest event-driven XGBoost+ExtraTrees live-shadow run is positive so far, but the sample is small. Continue reconciling `live_candidate_samples.jsonl` and `live_signal_samples.jsonl` against offline labels before tuning thresholds further.
 
 This is the highest-value task.
 
@@ -38,14 +38,24 @@ Current fill labels are too optimistic. Upgrade them to a conservative replay:
 
 Do not guess these from current state only.
 
-## 3. Deploy Best Offline Models Live
+## 3. Calibrate The Current Live Models
 
-Best offline models from training_20260422 are not yet deployed:
+The current Ireland live-shadow model is already:
 
-- XGBoost fill classifier (p>=0.7: 64.9% win, EV +0.0313)
-- ExtraTrees unwind regressor (rank_corr 0.201)
+- XGBoost fill classifier
+- ExtraTrees unwind regressor
+- `training_eventdriven_20260423`
+- BTC 5m only
 
-Try deploying XGBoost+ExtraTrees with relaxed thresholds (e.g. threshold=0.005, min_p_fill=0.5, min_pred_unwind_profit=-0.02) to observe live score distributions before tightening.
+Next step is not another deployment. Accumulate at least 500 resolved candidate samples, then run:
+
+```bash
+python scripts/analyze_live_calibration.py \
+  --samples logs/live_candidate_samples.jsonl \
+  --output-dir artifacts/live_calibration/<timestamp>
+```
+
+Use validation-style analysis to decide whether `p_fill`, `pred_expected_profit`, and `pred_unwind_profit` are calibrated enough to tighten or loosen gates.
 
 ## 4. Add Validation-Tested Live Filters
 

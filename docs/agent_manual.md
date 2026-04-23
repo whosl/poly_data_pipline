@@ -26,8 +26,8 @@ Do not paste private key contents into tracked docs, chat, logs, or commits.
 - GitHub: `git@github.com:whosl/poly_data_pipline.git`
 - Local workspace used in this thread: `/Users/wenzhuolin/dev/poly/poly_trade_pipeline`
 - Main branch: `master`
-- Latest pushed commit at the time this manual was rewritten: `86d8195 Add two-stage live execution policy logging`
-- Important current local state: there may be uncommitted live/shadow changes in `poly/predict/pipeline.py` and docs.
+- Latest pushed commit observed in this thread: `addc8fa Align live calibration signal window`
+- Important current local state: there may be uncommitted docs and sampling-code changes from another agent. Do not overwrite them.
 
 Always start with:
 
@@ -66,18 +66,19 @@ entry filters pass
 cooldown / max-entry gates pass
 ```
 
-The most recent live policy on Ireland uses the `training_20260422` artifacts with EWMA features and winsorize preprocessing:
+The most recent verified live policy on Ireland uses the `training_eventdriven_20260423` artifacts:
 
 ```text
-RandomForest classifier + RandomForest unwind regressor
-pred_expected_profit >= 0.005
-p_fill >= 0.7
-pred_unwind_profit >= 0.0
+XGBoost fill classifier + ExtraTrees unwind regressor
+pred_expected_profit >= 0.025
+p_fill >= 0.5
+pred_unwind_profit >= -0.05
+POLY_UPDOWN_MARKETS=btc-updown-5m
 ```
 
-This produced zero signals because live `p_fill` max was ~0.638 (below 0.7) and `pred_unwind_profit` max was ~-0.009 (below 0.0). A prior single-model RF run at threshold=0.67 produced 39 signals in 10 minutes but only 7.7% accuracy.
+This event-driven model is deployed live-shadow only; it does not place real orders. Verification on Ireland showed only `btc-updown-5m-*` markets and no `btc-updown-15m` subscriptions. A parsed early live sample showed 33 resolved signals, 28 profitable, total profit about `+0.3355`. Treat that as a small encouraging sample, not proof of a stable edge.
 
-Best offline models (training_20260422): XGBoost fill classifier (p>=0.7: 64.9% win, EV +0.0313) + ExtraTrees unwind regressor (rank_corr 0.201). Not yet deployed live.
+Historical note: the earlier `training_20260422` RF+RF policy produced zero signals because live `p_fill` max was ~0.638 below its 0.7 gate and `pred_unwind_profit` max was ~-0.009 below its 0.0 gate. A prior single-model RF run at threshold=0.67 produced 39 signals in 10 minutes but only 7.7% accuracy.
 
 ## Non-Negotiable Rules
 
@@ -91,12 +92,12 @@ Best offline models (training_20260422): XGBoost fill classifier (p>=0.7: 64.9% 
 
 ## Current Bottom Line
 
-Offline models can produce attractive validation/test slices, especially on BTC 5m data. Live-shadow runs have not yet confirmed the edge. The major gap is not model horsepower; it is label realism and offline/live alignment:
+Offline models can produce attractive validation/test slices, especially on BTC 5m data. The latest event-driven live-shadow run is positive so far, but the sample is still small. The major gap is still label realism and offline/live alignment:
 
-- maker fill labels are too optimistic
+- maker fill labels may still be optimistic despite the current trade-through rule
 - queue position is not modeled
-- live fill rate is much lower than offline labels imply
+- live fill rate and p_fill calibration need more resolved candidate samples
 - unwind tail losses are underpredicted
 - extreme price regimes are dangerous
 
-The next agent should spend its energy on queue-aware second-leg labels, offline/live reconciliation, and validation-tested filters before tuning more models.
+The next agent should spend its energy on live candidate calibration, queue-aware second-leg labels, offline/live reconciliation, and validation-tested filters before tuning more models.

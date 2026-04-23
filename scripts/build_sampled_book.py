@@ -228,6 +228,9 @@ def _downsample_event_driven(lf: pl.LazyFrame, args: argparse.Namespace) -> pl.L
     Tier 2 (secondary columns): change triggers only if abs(delta) > threshold.
 
     Always keeps the first row per asset.
+
+    Fully vectorized: uses Polars window functions (over) instead of
+    partition_by + Python loop.  Much faster on large datasets.
     """
     schema = lf.collect_schema()
 
@@ -247,10 +250,8 @@ def _downsample_event_driven(lf: pl.LazyFrame, args: argparse.Namespace) -> pl.L
     # Build magnitude thresholds for tier2
     mag_thresholds = dict(DEFAULT_MAGNITUDE_THRESHOLDS)
     if args.magnitude is not None:
-        # Uniform override: apply to all tier2 columns
         mag_thresholds = {c: args.magnitude for c in tier2}
     else:
-        # Only keep thresholds for columns actually in tier2
         mag_thresholds = {c: mag_thresholds.get(c, 0.0) for c in tier2}
 
     min_gap_ns = int(args.min_gap_ms * NS_PER_MS)
@@ -262,51 +263,36 @@ def _downsample_event_driven(lf: pl.LazyFrame, args: argparse.Namespace) -> pl.L
         min_gap_ms=args.min_gap_ms,
     )
 
-    # Collect the filtered + sorted frame, then process per-asset.
-    df_all = lf.sort(["asset_id", "recv_ns"]).collect()
-    total_in = df_all.height
-    logger.info("event_driven_rows", rows=total_in)
+    # --- Fully vectorized change detection using over("asset_id") ---
+    lf = lf.sort(["asset_id", "recv_ns"])
 
-    partitions = df_all.partition_by("asset_id", as_dict=False)
-    parts: list[pl.DataFrame] = []
-    total_out = 0
+    # Build the _changed boolean expression using windowed shift
+    # Use a dummy column to anchor the expression; we'll assemble the full
+    # OR-chain below and apply it in a single with_columns call.
+    changed_expr = pl.lit(False)
 
-    for chunk in partitions:
-        if chunk.height == 0:
-            continue
+    # Tier 1: any change (including null transition) triggers
+    for col in tier1:
+        prev = pl.col(col).shift(1).over("asset_id")
+        changed_expr = changed_expr | (pl.col(col) != prev) | (
+            pl.col(col).is_not_null() != prev.is_not_null()
+        )
 
-        # Tier 1: any change triggers
-        changed = pl.lit(False)
-        for col in tier1:
-            prev = pl.col(col).shift(1)
-            changed = changed | (pl.col(col) != prev) | (pl.col(col).is_not_null() != prev.is_not_null())
+    # Tier 2: only if abs(delta) > threshold
+    for col in tier2:
+        thresh = mag_thresholds.get(col, 0.0)
+        delta = (pl.col(col) - pl.col(col).shift(1).over("asset_id")).abs()
+        changed_expr = changed_expr | (delta > thresh)
 
-        # Tier 2: only if abs(delta) > threshold
-        for col in tier2:
-            thresh = mag_thresholds.get(col, 0.0)
-            delta = (pl.col(col) - pl.col(col).shift(1)).abs()
-            changed = changed | (delta > thresh)
+    lf = lf.with_columns(changed_expr.alias("_changed"))
+    lf = lf.filter(pl.col("_changed")).drop("_changed")
 
-        chunk = chunk.with_columns(changed.alias("_changed"))
-        chunk = chunk.filter(pl.col("_changed")).drop("_changed")
+    # Debounce: drop events closer than min_gap_ns to the previous kept event
+    if min_gap_ns > 0:
+        gap = pl.col("recv_ns") - pl.col("recv_ns").shift(1).over("asset_id")
+        lf = lf.filter(gap.is_null() | (gap >= min_gap_ns))
 
-        # Debounce: drop events closer than min_gap_ns to the previous kept event
-        if min_gap_ns > 0 and chunk.height > 0:
-            gap = pl.col("recv_ns") - pl.col("recv_ns").shift(1)
-            keep = gap.is_null() | (gap >= min_gap_ns)
-            chunk = chunk.filter(keep)
-
-        total_out += chunk.height
-        parts.append(chunk)
-
-    result = pl.concat(parts) if parts else df_all.head(0)
-    logger.info(
-        "event_driven_done",
-        rows_in=total_in,
-        rows_out=total_out,
-        ratio=f"{total_out / total_in * 100:.1f}%" if total_in else "N/A",
-    )
-    return result.lazy()
+    return lf
 
 
 def ensure_book_columns(lf: pl.LazyFrame) -> pl.LazyFrame:

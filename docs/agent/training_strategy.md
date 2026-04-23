@@ -84,19 +84,24 @@ Current live signal gates:
 - signal cooldown
 - max entries per signal key
 
-The current online RF+RF policy (training_20260422 artifacts) uses:
+The current verified Ireland live-shadow policy (`training_eventdriven_20260423` artifacts) uses:
 
 ```text
-threshold = 0.005
-min_p_fill = 0.7
-min_pred_unwind_profit = 0.0
-min_entry_ask = 0.05
-max_entry_ask = 0.95
+fill model = xgboost_classifier
+unwind model = extra_trees_regressor
+threshold = 0.025
+min_p_fill = 0.5
+min_pred_unwind_profit = -0.05
+min_entry_ask = 0.10
+max_entry_ask = 0.90
 min_time_to_expiry = 20
 max_spread = 0.05
 signal_cooldown = 10 (defaults to horizon)
 max_entries_per_signal_key = 0 (unlimited)
+POLY_UPDOWN_MARKETS = btc-updown-5m
 ```
+
+The previous `training_20260422` RF+RF policy used `threshold=0.005, min_p_fill=0.7, min_pred_unwind_profit=0.0` and produced 0 signals after 2000 predictions.
 
 Previous policy (training_reprofit_20260420_21_5m artifacts) used `threshold=0.020, min_p_fill=0.85` but produced 0 signals because live p_fill max was ~0.74.
 
@@ -135,7 +140,54 @@ Do not add deep learning yet. The bottleneck is label realism and offline/live a
 
 ## Core Commands
 
-### Latest training_20260422 pipeline
+### Latest training_eventdriven_20260423 pipeline
+
+Build event-driven sampled book:
+
+```bash
+python scripts/build_sampled_book.py --mode event-driven --overwrite --dates 20260420 20260421
+```
+
+Observed sampled rows:
+
+```text
+20260420: 7,234,818
+20260421: 7,245,926
+```
+
+Build features:
+
+```bash
+python scripts/build_features.py \
+  --data-dir data \
+  --dates 20260420 20260421 \
+  --output-dir artifacts/training_eventdriven_20260423 \
+  --sample-interval-ms 100
+```
+
+Train fill classifiers:
+
+```bash
+python scripts/train_alpha_model.py \
+  --dataset artifacts/training_eventdriven_20260423/alpha_dataset.parquet \
+  --output-dir artifacts/training_eventdriven_20260423/fill_models \
+  --target-reg first_unwind_profit_proxy_10s \
+  --target-cls y_two_leg_entry_10s \
+  --models random_forest_classifier extra_trees_classifier lightgbm_classifier xgboost_classifier
+```
+
+Train unwind regressors:
+
+```bash
+python scripts/train_alpha_model.py \
+  --dataset artifacts/training_eventdriven_20260423/alpha_dataset.parquet \
+  --output-dir artifacts/training_eventdriven_20260423/unwind_models \
+  --target-reg first_unwind_profit_proxy_10s \
+  --target-cls y_two_leg_entry_10s \
+  --models random_forest_regressor extra_trees_regressor lightgbm_regressor xgboost_regressor
+```
+
+### Previous training_20260422 pipeline
 
 Build sampled book (time-bucket 250ms):
 

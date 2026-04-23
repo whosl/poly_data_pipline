@@ -303,3 +303,131 @@ python scripts/live_predict.py \
 Result after 2000 predictions: 0 signals. Live p_fill max 0.638 (below 0.7), pred_unwind_profit max -0.009 (below 0.0). Train/test distribution shift suspected.
 
 Prior single-model RF run (threshold=0.67, same artifacts) produced 39 signals in 10 minutes but only 7.7% accuracy (3/39 profitable, total profit -1.23).
+
+## Event-Driven Downsampling Optimization
+
+Replaced time-bucket (250ms) downsampling with optimized event-driven mode using vectorized Polars window functions. Key insight: instead of iterating rows, use `shift()` + `ne_missing()` to detect state changes in a single vectorized pass.
+
+Default event columns:
+- Tier 1, any change triggers: `best_bid`, `best_ask`, `total_bid_levels`, `total_ask_levels`
+- Tier 2, change triggers only above magnitude threshold: `depth_top1_imbalance`, `depth_top3_imbalance`, `depth_top5_imbalance`, `depth_top10_imbalance`, `depth_top20_imbalance`, `cum_bid_depth_top10`, `cum_ask_depth_top10`, `cum_bid_depth_top20`, `cum_ask_depth_top20`
+
+Compression results on 20260420+20260421 (123.1M raw rows: 64.2M on 20260420, 58.9M on 20260421):
+- Pure event-driven: 82.3% retention (too much, depth features change constantly)
+- With 1ms debounce: 37.8%
+- With 5ms debounce: 10.7%
+- With 10ms debounce: 4.8%
+
+Final approach: event-driven with default settings (`min_gap_ms=0`, no debounce; tier2 still uses default magnitude thresholds of `0.001` for imbalance and `10.0` for cumulative depth). Generated 14.5M rows total: 7,234,818 rows for 20260420 and 7,245,926 rows for 20260421, about 10.4x more data than time-bucket.
+
+Command:
+```bash
+python scripts/build_sampled_book.py --mode event-driven --overwrite --dates 20260420 20260421
+```
+
+## New Training Run: training_eventdriven_20260423
+
+Trained on event-driven sampled book data:
+- `artifacts/training_eventdriven_20260423/alpha_dataset.parquet`: 3,091,181 rows × 181 columns
+- 5m subset: 1,630,456 rows
+- 15m subset: 1,460,725 rows
+- Feature columns: 118
+- Dates: 20260420 + 20260421
+- Split: chronological 70/15/15
+
+Fill classifiers trained: RF, ExtraTrees, LightGBM, XGBoost
+Unwind regressors trained: RF, ExtraTrees, LightGBM, XGBoost
+
+Best models selected:
+- Fill: **XGBoost classifier** (AUC=0.7573, p>=0.5: 88.2% win rate, sharpe +11.05)
+- Unwind: **ExtraTrees regressor** (R2=0.0478, rank_corr=0.231)
+
+Optimal thresholds from execution policy analysis:
+- `threshold=0.025`, `min_p_fill=0.5`, `min_pred_unwind_profit=-0.05`
+
+## Event-Driven Model Deployment to Ireland
+
+Deployed XGBoost fill classifier + ExtraTrees unwind regressor from training_eventdriven_20260423 to Ireland via SCP:
+
+```bash
+# Fill model
+scp -4 -i /Users/wenzhuolin/Downloads/EuKey.pem \
+  artifacts/training_eventdriven_20260423/fill_models/xgboost_classifier.joblib \
+  artifacts/training_eventdriven_20260423/fill_models/training_metadata.json \
+  ubuntu@108.132.27.76:~/poly_trade_pipeline/artifacts/training_eventdriven_20260423/fill_models/
+
+# Unwind model
+scp -4 -i /Users/wenzhuolin/Downloads/EuKey.pem \
+  artifacts/training_eventdriven_20260423/unwind_models/extra_trees_regressor.joblib \
+  artifacts/training_eventdriven_20260423/unwind_models/training_metadata.json \
+  ubuntu@108.132.27.76:~/poly_trade_pipeline/artifacts/training_eventdriven_20260423/unwind_models/
+```
+
+sklearn version mismatch warning (local 1.8.0 vs Ireland 1.7.2) — non-critical, models load and run correctly.
+
+## 5m-Only Market Subscription
+
+Model was trained exclusively on 5m market data. Changed Ireland pipeline to subscribe only to 5m markets via environment variable:
+
+```bash
+POLY_UPDOWN_MARKETS=btc-updown-5m
+```
+
+This limits live Polymarket subscription to the active BTC 5m Up/Down market. Recent logs after deployment showed about 17-19 model predictions/sec.
+
+Pipeline launch command on Ireland:
+```bash
+cd ~/poly_trade_pipeline && POLY_UPDOWN_MARKETS=btc-updown-5m nohup .venv/bin/python scripts/live_predict.py \
+  --model-path artifacts/training_eventdriven_20260423/fill_models/xgboost_classifier.joblib \
+  --unwind-model-path artifacts/training_eventdriven_20260423/unwind_models/extra_trees_regressor.joblib \
+  --threshold 0.025 --min-p-fill 0.5 --min-pred-unwind-profit -0.05 \
+  --sample-interval 100 --min-entry-ask 0.10 --max-entry-ask 0.90 \
+  --signal-sample-path logs/live_signal_samples.jsonl \
+  --candidate-sample-path logs/live_candidate_samples.jsonl \
+  --candidate-sample-interval-ms 1000 \
+  --maker-fill-latency-ms 250 --maker-fill-trade-through-ticks 1.0 \
+  > /tmp/live_predict.log 2>&1 &
+```
+
+## Live Results: Event-Driven Model on Ireland (2026-04-23)
+
+First 23 signals after deployment (5m markets only):
+
+| Metric | Value |
+|---|---|
+| Total signals | 23 |
+| Profitable win rate | 82.6% (19/23) |
+| Total profit | +0.1848 |
+| Avg profit | +0.0080 |
+| Success path rate | 73.9% (17/23) |
+| Unwind path rate | 26.1% (6/23) |
+
+Notable: early signals (S000001-008) had 2 large unwind losses totaling -0.19, but subsequent signals (S000009-023) showed consistent profitability with total +0.271 across 15 signals.
+
+Direction accuracy: 88.9% (8/9 verifiable from early signals). The model's directional prediction is strong; main risk is second-leg fill failure on unwind path.
+
+Later verification from the same `/tmp/live_predict.log` showed 33 resolved signals:
+- Profitable: 28/33 = 84.8%
+- Success path: 26/33 = 78.8%
+- Total profit: +0.3355
+- Avg profit: +0.0102
+
+Treat this as a small live-shadow sample, not proof of stable edge.
+
+## SSH Connectivity: IPv4 Direct Access
+
+Ireland and Tokyo Lightsail instances are accessible via IPv4 when Clash TUN mode is disabled on the local Mac.
+
+**Critical**: Clash TUN mode (utun4 interface) intercepts all traffic including IPv4. Must be disabled for direct SSH.
+
+Ireland IPv4:
+```bash
+ssh -4 -i /Users/wenzhuolin/Downloads/EuKey.pem -o ConnectTimeout=10 -o StrictHostKeyChecking=no ubuntu@108.132.27.76
+```
+
+Tokyo IPv4:
+```bash
+ssh -4 -i /Users/wenzhuolin/Downloads/LightsailDefaultKey-ap-northeast-1.pem -o ConnectTimeout=10 -o StrictHostKeyChecking=no ubuntu@16.171.27.253
+```
+
+See `docs/private/ireland_lightsail.md` and `docs/private/tokyo_lightsail.md` for full connection details.

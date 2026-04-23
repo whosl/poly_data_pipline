@@ -137,6 +137,53 @@ The current evidence says:
 
 Do not infer production edge from any single table above.
 
+## training_eventdriven_20260423: Event-Driven Sampled Book
+
+Dataset:
+- `artifacts/training_eventdriven_20260423/alpha_dataset.parquet`
+- rows: 3,091,181
+- columns: 181
+- feature columns: 118
+- symbol: BTC only
+- periods: 5m = 1,630,456 rows, 15m = 1,460,725 rows
+- dates: `20260420`, `20260421`
+- split: chronological 70/15/15
+
+Sampled book inputs:
+- `data/normalized/20260420/poly_sampled_book.parquet`: 7,234,818 rows
+- `data/normalized/20260421/poly_sampled_book.parquet`: 7,245,926 rows
+- source `poly_l2_book` rows: 64,243,394 on 20260420 and 58,878,879 on 20260421
+
+Event-driven defaults in `scripts/build_sampled_book.py`:
+- Tier 1, any change triggers: `best_bid`, `best_ask`, `total_bid_levels`, `total_ask_levels`
+- Tier 2, magnitude-filtered: `depth_top1/3/5/10/20_imbalance`, `cum_bid/ask_depth_top10/20`
+- `min_gap_ms=0`, so no debounce
+- tier2 magnitude thresholds still apply by default: `0.001` for imbalance, `10.0` for cumulative depth
+
+Artifacts:
+- fill models: `artifacts/training_eventdriven_20260423/fill_models/`
+- unwind models: `artifacts/training_eventdriven_20260423/unwind_models/`
+
+Selected live-shadow policy:
+
+```text
+fill model: xgboost_classifier
+unwind model: extra_trees_regressor
+threshold = 0.025
+min_p_fill = 0.5
+min_pred_unwind_profit = -0.05
+market scope = btc-updown-5m only
+```
+
+Early Ireland live-shadow verification:
+
+| Window | Profitable | Success Path | Total Profit | Avg Profit |
+| --- | ---: | ---: | ---: | ---: |
+| first 23 resolved | 19/23 = 82.6% | 17/23 = 73.9% | `+0.1848` | `+0.0080` |
+| first 33 resolved | 28/33 = 84.8% | 26/33 = 78.8% | `+0.3355` | `+0.0102` |
+
+This run is encouraging but is still a small live sample. Continue candidate calibration before treating it as stable edge.
+
 ## training_20260422: EWMA + Winsorize + Time-Bucket
 
 Dataset:
