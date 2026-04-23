@@ -159,7 +159,6 @@ class UpDownCollector:
         async with websockets.connect(url, ping_interval=None) as ws:
             self._ws = ws
             rotation_task = asyncio.create_task(self._rotation_loop())
-            heartbeat_task = asyncio.create_task(self._heartbeat(ws))
 
             try:
                 async for message in ws:
@@ -195,19 +194,8 @@ class UpDownCollector:
                         for msg in relevant_messages:
                             self._dispatch(msg, recv_ns)
             finally:
-                heartbeat_task.cancel()
                 rotation_task.cancel()
                 self._ws = None
-
-    async def _heartbeat(self, ws) -> None:
-        """Send periodic text PING to keep NAT mapping alive."""
-        interval = self.config.ws_ping_interval
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await ws.send("PING")
-            except Exception:
-                return
 
     def _reset_subscription_state(self, reason: str) -> None:
         """Clear per-connection subscription state before opening a new WS."""

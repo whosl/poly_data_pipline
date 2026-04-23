@@ -177,7 +177,6 @@ async def _run_poly_ws(
                     _rotation_loop(ws, config, market_defs, subscribed_assets, asset_metadata,
                                    slug_assets, slug_expiry_ts, known_slugs, engine, shutdown),
                 )
-                heartbeat_task = asyncio.create_task(_heartbeat(ws, config.ws_ping_interval, shutdown))
                 try:
                     async for message in ws:
                         if shutdown.is_set():
@@ -204,7 +203,6 @@ async def _run_poly_ws(
                                 continue
                             _dispatch_poly(msg, recv_ns, subscribed_assets, engine, pipeline, asset_metadata)
                 finally:
-                    heartbeat_task.cancel()
                     rotation_task.cancel()
 
             backoff = 1.0
@@ -216,14 +214,6 @@ async def _run_poly_ws(
             backoff = min(backoff * 2, 30.0)
 
 
-async def _heartbeat(ws, interval: float, shutdown: asyncio.Event) -> None:
-    """Send periodic text PING to keep NAT mapping alive."""
-    while not shutdown.is_set():
-        await asyncio.sleep(interval)
-        try:
-            await ws.send("PING")
-        except Exception:
-            return
 
 
 def _dispatch_poly(msg: dict, recv_ns: int, subscribed: dict, engine: OrderBookEngine,

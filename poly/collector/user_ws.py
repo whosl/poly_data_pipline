@@ -66,8 +66,6 @@ class PolymarketUserWS:
                 })
                 await ws.send(sub)
 
-            heartbeat_task = asyncio.create_task(self._heartbeat(ws))
-
             try:
                 async for message in ws:
                     import poly_core
@@ -94,17 +92,7 @@ class PolymarketUserWS:
                     elif event_type == "trade":
                         self._handle_trade(msg, recv_ns)
             finally:
-                heartbeat_task.cancel()
-
-    async def _heartbeat(self, ws) -> None:
-        """Send periodic text PING to keep NAT mapping alive."""
-        interval = self.config.ws_ping_interval
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await ws.send("PING")
-            except Exception:
-                return
+                pass
 
     def _handle_order(self, msg: dict, recv_ns: int) -> None:
         order_id = msg.get("id", "")

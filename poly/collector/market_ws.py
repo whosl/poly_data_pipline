@@ -83,7 +83,6 @@ class PolymarketMarketWS:
             # Start background tasks
             watchdog = DataWatchdog(self.config.watchdog_timeout)
             watchdog_task = asyncio.create_task(self._watchdog_check(ws, watchdog))
-            heartbeat_task = asyncio.create_task(self._heartbeat(ws))
 
             try:
                 async for message in ws:
@@ -131,19 +130,8 @@ class PolymarketMarketWS:
                                        old=msg.get("old_tick_size"), new=msg.get("new_tick_size"))
 
             finally:
-                heartbeat_task.cancel()
                 watchdog_task.cancel()
                 self._ws = None
-
-    async def _heartbeat(self, ws) -> None:
-        """Send periodic text PING to keep NAT mapping alive."""
-        interval = self.config.ws_ping_interval
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await ws.send("PING")
-            except Exception:
-                return
 
     async def _watchdog_check(self, ws, watchdog: DataWatchdog) -> None:
         while True:
