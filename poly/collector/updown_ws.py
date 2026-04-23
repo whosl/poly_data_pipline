@@ -156,9 +156,8 @@ class UpDownCollector:
             markets=[m[0] for m in self._market_defs],
         )
 
-        async with websockets.connect(url, ping_interval=None) as ws:
+        async with websockets.connect(url) as ws:
             self._ws = ws
-            heartbeat_task = asyncio.create_task(self._heartbeat(ws))
             rotation_task = asyncio.create_task(self._rotation_loop())
 
             try:
@@ -195,7 +194,6 @@ class UpDownCollector:
                         for msg in relevant_messages:
                             self._dispatch(msg, recv_ns)
             finally:
-                heartbeat_task.cancel()
                 rotation_task.cancel()
                 self._ws = None
 
@@ -413,14 +411,6 @@ class UpDownCollector:
         }
         row.update(self._metadata_fields(self._asset_metadata.get(asset_id), slug))
         self.bba_writer.append(row)
-
-    async def _heartbeat(self, ws) -> None:
-        while True:
-            await asyncio.sleep(self.config.ws_ping_interval)
-            try:
-                await ws.send("PING")
-            except Exception:
-                break
 
     @staticmethod
     def _book_row(features: dict, recv_ns: int, exchange_ts: int,

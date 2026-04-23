@@ -47,7 +47,7 @@ class PolymarketUserWS:
         url = self.config.poly_user_ws_url
         logger.info("user_ws_connecting", url=url)
 
-        async with websockets.connect(url, ping_interval=None) as ws:
+        async with websockets.connect(url) as ws:
             auth_msg = orjson.dumps({
                 "auth": {
                     "apiKey": self.config.api_key,
@@ -65,8 +65,6 @@ class PolymarketUserWS:
                     "operation": "subscribe",
                 })
                 await ws.send(sub)
-
-            heartbeat_task = asyncio.create_task(self._heartbeat(ws))
 
             try:
                 async for message in ws:
@@ -86,15 +84,7 @@ class PolymarketUserWS:
                     elif event_type == "trade":
                         self._handle_trade(msg, recv_ns)
             finally:
-                heartbeat_task.cancel()
-
-    async def _heartbeat(self, ws) -> None:
-        while True:
-            await asyncio.sleep(self.config.ws_ping_interval)
-            try:
-                await ws.send("PING")
-            except Exception:
-                break
+                pass
 
     def _handle_order(self, msg: dict, recv_ns: int) -> None:
         order_id = msg.get("id", "")

@@ -172,8 +172,7 @@ async def _run_poly_ws(
             url = config.poly_market_ws_url
             logger.info("poly_ws_connecting", url=url)
 
-            async with websockets.connect(url, ping_interval=None) as ws:
-                heartbeat_task = asyncio.create_task(_heartbeat(ws, config.ws_ping_interval, shutdown))
+            async with websockets.connect(url) as ws:
                 rotation_task = asyncio.create_task(
                     _rotation_loop(ws, config, market_defs, subscribed_assets, asset_metadata,
                                    slug_assets, slug_expiry_ts, known_slugs, engine, shutdown),
@@ -204,7 +203,6 @@ async def _run_poly_ws(
                                 continue
                             _dispatch_poly(msg, recv_ns, subscribed_assets, engine, pipeline, asset_metadata)
                 finally:
-                    heartbeat_task.cancel()
                     rotation_task.cancel()
 
             backoff = 1.0
@@ -366,15 +364,6 @@ async def _run_binance_ws(config, pipeline: PredictionPipeline, symbols: list[st
             logger.warning("binance_ws_error", error=str(e), backoff=backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
-
-
-async def _heartbeat(ws, interval: float, shutdown: asyncio.Event) -> None:
-    while not shutdown.is_set():
-        await asyncio.sleep(interval)
-        try:
-            await ws.send("PING")
-        except Exception:
-            break
 
 
 # ---------------------------------------------------------------------------
