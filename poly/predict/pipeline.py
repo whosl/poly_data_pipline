@@ -101,6 +101,10 @@ class SignalSampleWriter:
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def enabled(self) -> bool:
+        return self.path is not None
+
     def write(self, record: dict) -> None:
         if self.path is None:
             return
@@ -448,9 +452,12 @@ class PendingPrediction:
     second_leg_quote_price: float = 0.0
     maker_fill_price: float | None = None
     maker_fill_ns: int | None = None
+    maker_fill_threshold: float | None = None
     future_best_bid_at_resolve: float | None = None
     future_best_ask_at_resolve: float | None = None
     future_mid_at_resolve: float | None = None
+    tick_size_at_entry: float = 0.01
+    track_stats: bool = True
 
 
 @dataclass
@@ -493,17 +500,24 @@ class OutcomeMonitor:
         fee_rate: float = 0.072,
         price_buffer: float = 0.01,
         maker_fill_trade_side: str = "SELL",
+        maker_fill_latency_ms: int = 250,
+        maker_fill_trade_through_ticks: float = 1.0,
+        tick_size_fallback: float = 0.01,
     ):
         self.horizon_seconds = horizon_seconds
         self.fee_rate = fee_rate
         self.price_buffer = price_buffer
         self.maker_fill_trade_side = maker_fill_trade_side.upper()
+        self.maker_fill_latency_ns = max(0, int(maker_fill_latency_ms)) * NS_PER_MS
+        self.maker_fill_trade_through_ticks = maker_fill_trade_through_ticks
+        self.tick_size_fallback = tick_size_fallback
         self.pending: list[PendingPrediction] = []
         self.stats = MonitorStats()
 
     def add_signal(self, pred: PendingPrediction) -> None:
         self.pending.append(pred)
-        self.stats.total_signals += 1
+        if pred.track_stats:
+            self.stats.total_signals += 1
 
     def observe_trade(self, asset_id: str, side: str, price: float, recv_ns: int) -> None:
         """Record future opposite trade evidence for pending maker fills.
@@ -519,25 +533,30 @@ class OutcomeMonitor:
                 continue
             if pred.opposite_asset_id != asset_id:
                 continue
-            if recv_ns <= pred.predict_ns:
+            if recv_ns < pred.predict_ns + self.maker_fill_latency_ns:
                 continue
             if recv_ns > pred.predict_ns + self.horizon_seconds * NS_PER_SECOND:
                 continue
-            if price <= pred.second_leg_quote_price:
+            tick_size = pred.tick_size_at_entry if pred.tick_size_at_entry > 0 else self.tick_size_fallback
+            fill_threshold = pred.second_leg_quote_price - self.maker_fill_trade_through_ticks * tick_size
+            if price <= fill_threshold + 1e-12:
                 pred.maker_fill_price = price
                 pred.maker_fill_ns = recv_ns
-                logger.info(
-                    "maker_fill_observed",
-                    signal_id=pred.signal_id,
-                    signal_key=pred.signal_key,
-                    slug=short_slug(pred.slug),
-                    outcome=pred.outcome,
-                    asset=short_id(pred.asset_id),
-                    opposite_asset=short_id(pred.opposite_asset_id),
-                    quote_price=fmt_price(pred.second_leg_quote_price),
-                    trade_price=fmt_price(price),
-                    fill_lag_ms=fmt_ms(recv_ns - pred.predict_ns),
-                )
+                pred.maker_fill_threshold = fill_threshold
+                if pred.track_stats:
+                    logger.info(
+                        "maker_fill_observed",
+                        signal_id=pred.signal_id,
+                        signal_key=pred.signal_key,
+                        slug=short_slug(pred.slug),
+                        outcome=pred.outcome,
+                        asset=short_id(pred.asset_id),
+                        opposite_asset=short_id(pred.opposite_asset_id),
+                        quote_price=fmt_price(pred.second_leg_quote_price),
+                        fill_threshold=fmt_price(fill_threshold),
+                        trade_price=fmt_price(price),
+                        fill_lag_ms=fmt_ms(recv_ns - pred.predict_ns),
+                    )
 
     def check_outcomes(
         self,
@@ -599,10 +618,11 @@ class OutcomeMonitor:
             # quote price, while trade evidence only proves the quote was
             # marketable/fillable within the horizon.
             profit = success_revenue - success_total_cost
-            self.stats.total_success += 1
-            self.stats.recent_profits.append(profit)
-            self.stats.total_profit += profit
-            self.stats.total_resolved += 1
+            if pred.track_stats:
+                self.stats.total_success += 1
+                self.stats.recent_profits.append(profit)
+                self.stats.total_profit += profit
+                self.stats.total_resolved += 1
             return {
                 "result": "success",
                 "profit": profit,
@@ -611,6 +631,7 @@ class OutcomeMonitor:
                 "second_leg_size": second_leg_size,
                 "second_leg_quote": second_leg_price,
                 "second_leg_fill_price": pred.maker_fill_price,
+                "second_leg_fill_threshold": pred.maker_fill_threshold,
                 "second_leg_fill_lag_ms": (pred.maker_fill_ns - pred.predict_ns) / NS_PER_MS
                 if pred.maker_fill_ns is not None
                 else None,
@@ -630,10 +651,11 @@ class OutcomeMonitor:
         profit = unwind_revenue - first_leg_price
         result = "unwind" if pred.opposite_asset_id else "no_opposite"
         if pred.opposite_asset_id:
-            self.stats.total_failure += 1
-            self.stats.recent_profits.append(profit)
-            self.stats.total_profit += profit
-            self.stats.total_resolved += 1
+            if pred.track_stats:
+                self.stats.total_failure += 1
+                self.stats.recent_profits.append(profit)
+                self.stats.total_profit += profit
+                self.stats.total_resolved += 1
             return {
                 "result": result,
                 "profit": profit,
@@ -652,10 +674,11 @@ class OutcomeMonitor:
                 "future_mid": future_mid,
             }
 
-        self.stats.total_failure += 1
-        self.stats.recent_profits.append(profit)
-        self.stats.total_profit += profit
-        self.stats.total_resolved += 1
+        if pred.track_stats:
+            self.stats.total_failure += 1
+            self.stats.recent_profits.append(profit)
+            self.stats.total_profit += profit
+            self.stats.total_resolved += 1
         return {
             "result": result,
             "profit": profit,
@@ -701,6 +724,10 @@ class PredictionPipeline:
         max_spread: float = 0.05,
         max_entries_per_signal_key: int = 0,
         signal_sample_path: str | Path | None = "logs/live_signal_samples.jsonl",
+        candidate_sample_path: str | Path | None = "logs/live_candidate_samples.jsonl",
+        candidate_sample_interval_ms: int = 1000,
+        maker_fill_latency_ms: int = 250,
+        maker_fill_trade_through_ticks: float = 1.0,
     ):
         self.threshold = threshold
         self.min_p_fill = min_p_fill
@@ -718,6 +745,10 @@ class PredictionPipeline:
         self.max_spread = max_spread
         self.max_entries_per_signal_key = max(0, int(max_entries_per_signal_key))
         self.signal_samples = SignalSampleWriter(signal_sample_path)
+        self.candidate_samples = SignalSampleWriter(candidate_sample_path)
+        self.candidate_sample_interval_ns = max(0, int(candidate_sample_interval_ms)) * NS_PER_MS
+        self.maker_fill_latency_ms = max(0, int(maker_fill_latency_ms))
+        self.maker_fill_trade_through_ticks = maker_fill_trade_through_ticks
 
         # Load model. In two-stage mode, model_path is the fill classifier and
         # unwind_model_path is a signed-PnL regressor for the failure branch.
@@ -750,7 +781,13 @@ class PredictionPipeline:
         self.unwind_feature_columns = unwind_feature_cols or self.feature_columns
 
         self.assembler = LiveFeatureAssembler(self.feature_columns, self.cat_columns)
-        self.monitor = OutcomeMonitor(horizon_seconds, fee_rate, price_buffer)
+        self.monitor = OutcomeMonitor(
+            horizon_seconds,
+            fee_rate,
+            price_buffer,
+            maker_fill_latency_ms=self.maker_fill_latency_ms,
+            maker_fill_trade_through_ticks=self.maker_fill_trade_through_ticks,
+        )
 
         # State
         self.asset_states: dict[str, AssetState] = {}
@@ -768,6 +805,8 @@ class PredictionPipeline:
         self._last_signal_ns_by_key: dict[str, int] = {}
         self._signal_count_by_key: dict[str, int] = {}
         self._next_signal_id = 1
+        self._next_candidate_id = 1
+        self._last_candidate_ns_by_asset: dict[str, int] = {}
         self._score_window: deque[dict[str, float | None]] = deque(maxlen=10_000)
         self._block_counts: Counter[str] = Counter()
 
@@ -825,6 +864,8 @@ class PredictionPipeline:
                 "max_entries_per_signal_key": self.max_entries_per_signal_key,
                 "price_buffer": self.price_buffer,
                 "fee_rate": self.fee_rate,
+                "maker_fill_latency_ms": self.maker_fill_latency_ms,
+                "maker_fill_trade_through_ticks": self.maker_fill_trade_through_ticks,
             },
             "prediction": {
                 "p_fill": pred.proba,
@@ -842,6 +883,7 @@ class PredictionPipeline:
                 "fee_per_share": fee_per_share,
                 "second_leg_size": second_leg_size,
                 "second_leg_quote": second_leg_quote,
+                "tick_size": pred.tick_size_at_entry,
                 "success_profit_estimate": success_profit_estimate,
             },
             "features": pred.feature_values,
@@ -849,6 +891,9 @@ class PredictionPipeline:
 
     def _write_signal_open_sample(self, pred: PendingPrediction) -> None:
         self.signal_samples.write(self._signal_sample_base("live_signal_open_sample", pred, pred.predict_ns))
+
+    def _write_candidate_open_sample(self, pred: PendingPrediction) -> None:
+        self.candidate_samples.write(self._signal_sample_base("live_candidate_open_sample", pred, pred.predict_ns))
 
     def _write_signal_resolved_sample(
         self,
@@ -866,6 +911,23 @@ class PredictionPipeline:
         }
         record["outcome_detail"] = details
         self.signal_samples.write(record)
+
+    def _write_candidate_resolved_sample(
+        self,
+        pred: PendingPrediction,
+        details: dict[str, object],
+        resolve_ns: int,
+    ) -> None:
+        profit = float(details["profit"])
+        record = self._signal_sample_base("live_candidate_resolved_sample", pred, resolve_ns)
+        record["labels"] = {
+            f"final_profit_{self.horizon_seconds}s": profit,
+            f"y_final_profit_entry_{self.horizon_seconds}s": "enter" if profit > 0 else "skip",
+            f"y_final_profit_entry_binary_{self.horizon_seconds}s": int(profit > 0),
+            f"y_two_leg_entry_{self.horizon_seconds}s": "enter" if details.get("result") == "success" else "skip",
+        }
+        record["outcome_detail"] = details
+        self.candidate_samples.write(record)
 
     def handle_poly_book(self, asset_id: str, features: dict, recv_ns: int, metadata: dict | None = None) -> None:
         """Process a poly orderbook update and potentially run prediction."""
@@ -981,8 +1043,19 @@ class PredictionPipeline:
             and asset.best_bid > 0
             and asset.best_ask > 0
         )
+        last_candidate_ns = self._last_candidate_ns_by_asset.get(asset.asset_id, 0)
+        candidate_due = (
+            self.candidate_samples.enabled
+            and self.candidate_sample_interval_ns > 0
+            and recv_ns - last_candidate_ns >= self.candidate_sample_interval_ns
+            and has_opposite
+            and structural_entry_filter_ok
+        )
 
-        if not (cooldown_ok and max_entries_ok and has_opposite and structural_entry_filter_ok):
+        if not (
+            (cooldown_ok and max_entries_ok and has_opposite and structural_entry_filter_ok)
+            or candidate_due
+        ):
             self._record_pre_model_skip(
                 cooldown_ok=cooldown_ok,
                 max_entries_ok=max_entries_ok,
@@ -1107,6 +1180,7 @@ class PredictionPipeline:
                 fee_rate=self.fee_rate,
                 price_buffer=self.price_buffer,
                 second_leg_quote_price=second_leg_quote_price,
+                tick_size_at_entry=asset.tick_size,
             )
             self.monitor.add_signal(pred)
             self._write_signal_open_sample(pred)
@@ -1145,6 +1219,39 @@ class PredictionPipeline:
                 success_profit_estimate=f"{success_profit_estimate:+.6f}",
             )
 
+        if candidate_due:
+            candidate_id = f"C{self._next_candidate_id:06d}"
+            self._next_candidate_id += 1
+            candidate = PendingPrediction(
+                signal_id=candidate_id,
+                predict_ns=recv_ns,
+                asset_id=asset.asset_id,
+                market_id=asset.market_id,
+                outcome=asset.outcome,
+                signal_key=signal_key,
+                signal_seq_for_key=0,
+                best_bid_at_entry=asset.best_bid,
+                best_ask_at_entry=asset.best_ask,
+                current_mid_at_entry=asset.current_mid,
+                spread_at_entry=asset.current_spread,
+                time_to_expiry_at_entry=tte,
+                proba=proba,
+                pred_unwind_profit=pred_unwind_profit,
+                pred_expected_profit=pred_expected_profit,
+                decision_score=decision_score,
+                opposite_asset_id=asset.opposite_asset_id,
+                slug=asset.slug,
+                feature_values=dict(row),
+                fee_rate=self.fee_rate,
+                price_buffer=self.price_buffer,
+                second_leg_quote_price=second_leg_quote_price,
+                tick_size_at_entry=asset.tick_size,
+                track_stats=False,
+            )
+            self.monitor.add_signal(candidate)
+            self._write_candidate_open_sample(candidate)
+            self._last_candidate_ns_by_asset[asset.asset_id] = recv_ns
+
         self._maybe_log_stats()
 
     def _check_pending_outcomes(self, recv_ns: int) -> None:
@@ -1160,49 +1267,52 @@ class PredictionPipeline:
         for pred, details in resolved:
             profit = float(details["profit"])
             result = str(details["result"])
-            logger.info(
-                "signal_close",
-                signal_id=pred.signal_id,
-                signal_key=pred.signal_key,
-                signal_seq_for_key=pred.signal_seq_for_key,
-                slug=short_slug(pred.slug),
-                market_id=short_id(pred.market_id, 12),
-                outcome_pred=pred.outcome,
-                asset=short_id(pred.asset_id),
-                opposite_asset=short_id(pred.opposite_asset_id),
-                proba=f"{pred.proba:.6f}",
-                decision_score=fmt_float(pred.decision_score),
-                p_fill=f"{pred.proba:.6f}",
-                pred_unwind_profit=fmt_float(pred.pred_unwind_profit),
-                pred_expected_profit=fmt_float(pred.pred_expected_profit),
-                result=result,
-                profit=f"{profit:+.6f}",
-                entry_bid=fmt_price(pred.best_bid_at_entry),
-                entry_ask=fmt_price(pred.best_ask_at_entry),
-                entry_mid=fmt_price(pred.current_mid_at_entry),
-                entry_spread=fmt_price(pred.spread_at_entry),
-                entry_tte_seconds=f"{pred.time_to_expiry_at_entry:.1f}",
-                first_leg_price=fmt_price(float(details["first_leg_price"])),
-                fee_per_share=fmt_float(float(details["fee_per_share"])),
-                second_leg_size=fmt_float(float(details["second_leg_size"])),
-                second_leg_quote=fmt_price(float(details["second_leg_quote"])),
-                second_leg_fill_price=fmt_price(details.get("second_leg_fill_price")),
-                second_leg_fill_lag_ms=(
-                    "" if details.get("second_leg_fill_lag_ms") is None else f"{float(details['second_leg_fill_lag_ms']):.0f}"
-                ),
-                future_best_bid=fmt_price(float(details["future_best_bid"])),
-                future_best_ask=fmt_price(float(details["future_best_ask"])),
-                future_mid=fmt_price(float(details["future_mid"])),
-                unwind_revenue=fmt_float(details.get("unwind_revenue")),
-                unwind_price=fmt_price(details.get("unwind_price")),
-                unwind_price_move=fmt_price(details.get("unwind_price_move")),
-                success_revenue=fmt_float(details.get("success_revenue")),
-                first_leg_cost=fmt_float(details.get("first_leg_cost")),
-                second_leg_cost=fmt_float(details.get("second_leg_cost")),
-                total_cost=fmt_float(details.get("total_cost")),
-                running=self.monitor.stats.summary(),
-            )
-            self._write_signal_resolved_sample(pred, details, recv_ns)
+            if pred.track_stats:
+                logger.info(
+                    "signal_close",
+                    signal_id=pred.signal_id,
+                    signal_key=pred.signal_key,
+                    signal_seq_for_key=pred.signal_seq_for_key,
+                    slug=short_slug(pred.slug),
+                    market_id=short_id(pred.market_id, 12),
+                    outcome_pred=pred.outcome,
+                    asset=short_id(pred.asset_id),
+                    opposite_asset=short_id(pred.opposite_asset_id),
+                    proba=f"{pred.proba:.6f}",
+                    decision_score=fmt_float(pred.decision_score),
+                    p_fill=f"{pred.proba:.6f}",
+                    pred_unwind_profit=fmt_float(pred.pred_unwind_profit),
+                    pred_expected_profit=fmt_float(pred.pred_expected_profit),
+                    result=result,
+                    profit=f"{profit:+.6f}",
+                    entry_bid=fmt_price(pred.best_bid_at_entry),
+                    entry_ask=fmt_price(pred.best_ask_at_entry),
+                    entry_mid=fmt_price(pred.current_mid_at_entry),
+                    entry_spread=fmt_price(pred.spread_at_entry),
+                    entry_tte_seconds=f"{pred.time_to_expiry_at_entry:.1f}",
+                    first_leg_price=fmt_price(float(details["first_leg_price"])),
+                    fee_per_share=fmt_float(float(details["fee_per_share"])),
+                    second_leg_size=fmt_float(float(details["second_leg_size"])),
+                    second_leg_quote=fmt_price(float(details["second_leg_quote"])),
+                    second_leg_fill_price=fmt_price(details.get("second_leg_fill_price")),
+                    second_leg_fill_lag_ms=(
+                        "" if details.get("second_leg_fill_lag_ms") is None else f"{float(details['second_leg_fill_lag_ms']):.0f}"
+                    ),
+                    future_best_bid=fmt_price(float(details["future_best_bid"])),
+                    future_best_ask=fmt_price(float(details["future_best_ask"])),
+                    future_mid=fmt_price(float(details["future_mid"])),
+                    unwind_revenue=fmt_float(details.get("unwind_revenue")),
+                    unwind_price=fmt_price(details.get("unwind_price")),
+                    unwind_price_move=fmt_price(details.get("unwind_price_move")),
+                    success_revenue=fmt_float(details.get("success_revenue")),
+                    first_leg_cost=fmt_float(details.get("first_leg_cost")),
+                    second_leg_cost=fmt_float(details.get("second_leg_cost")),
+                    total_cost=fmt_float(details.get("total_cost")),
+                    running=self.monitor.stats.summary(),
+                )
+                self._write_signal_resolved_sample(pred, details, recv_ns)
+            else:
+                self._write_candidate_resolved_sample(pred, details, recv_ns)
 
     def _maybe_log_stats(self) -> None:
         # Periodic stats display

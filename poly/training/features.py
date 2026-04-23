@@ -141,6 +141,8 @@ def build_date_dataset(
         max_total_price=config.two_leg_max_total_price,
         no_fill_edge=config.two_leg_no_fill_edge,
         maker_fill_trade_side=config.two_leg_maker_fill_trade_side,
+        maker_fill_latency_ms=config.maker_fill_latency_ms,
+        maker_fill_trade_through_ticks=config.maker_fill_trade_through_ticks,
     )
     samples = add_final_profit_labels(
         samples,

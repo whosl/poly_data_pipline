@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--two-leg-max-total-price", type=float, default=0.96)
     parser.add_argument("--two-leg-no-fill-edge", type=float, default=-1.0)
     parser.add_argument("--two-leg-maker-fill-trade-side", default="SELL")
+    parser.add_argument("--maker-fill-latency-ms", type=int, default=250)
+    parser.add_argument("--maker-fill-trade-through-ticks", type=float, default=1.0)
     parser.add_argument("--fee-rate", type=float, default=0.072)
     parser.add_argument("--price-buffer", type=float, default=0.01)
     parser.add_argument("--taker-cost-bps", type=float, default=0.0)
@@ -60,6 +62,8 @@ def main() -> None:
         two_leg_max_total_price=args.two_leg_max_total_price,
         two_leg_no_fill_edge=args.two_leg_no_fill_edge,
         two_leg_maker_fill_trade_side=args.two_leg_maker_fill_trade_side,
+        maker_fill_latency_ms=args.maker_fill_latency_ms,
+        maker_fill_trade_through_ticks=args.maker_fill_trade_through_ticks,
         fee_rate=args.fee_rate,
         price_buffer=args.price_buffer,
         taker_cost_bps=args.taker_cost_bps,

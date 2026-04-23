@@ -63,6 +63,10 @@ async def run_pipeline(
     max_spread: float = 0.05,
     max_entries_per_signal_key: int = 0,
     signal_sample_path: str | Path | None = Path("logs/live_signal_samples.jsonl"),
+    candidate_sample_path: str | Path | None = Path("logs/live_candidate_samples.jsonl"),
+    candidate_sample_interval_ms: int = 1000,
+    maker_fill_latency_ms: int = 250,
+    maker_fill_trade_through_ticks: float = 1.0,
 ) -> None:
     config = get_config()
 
@@ -102,6 +106,10 @@ async def run_pipeline(
         max_spread=max_spread,
         max_entries_per_signal_key=max_entries_per_signal_key,
         signal_sample_path=signal_sample_path,
+        candidate_sample_path=candidate_sample_path,
+        candidate_sample_interval_ms=candidate_sample_interval_ms,
+        maker_fill_latency_ms=maker_fill_latency_ms,
+        maker_fill_trade_through_ticks=maker_fill_trade_through_ticks,
     )
     engine = OrderBookEngine()
 
@@ -127,6 +135,10 @@ async def run_pipeline(
         max_spread=max_spread,
         max_entries_per_signal_key=max_entries_per_signal_key,
         signal_sample_path=str(signal_sample_path) if signal_sample_path else None,
+        candidate_sample_path=str(candidate_sample_path) if candidate_sample_path else None,
+        candidate_sample_interval_ms=candidate_sample_interval_ms,
+        maker_fill_latency_ms=maker_fill_latency_ms,
+        maker_fill_trade_through_ticks=maker_fill_trade_through_ticks,
     )
 
     shutdown_event = asyncio.Event()
@@ -436,6 +448,16 @@ async def _run_binance_ws(config, pipeline: PredictionPipeline, symbols: list[st
     show_default=True,
     help="Append live signal features and resolved final-profit labels for offline replay checks.",
 )
+@click.option(
+    "--candidate-sample-path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=Path("logs/live_candidate_samples.jsonl"),
+    show_default=True,
+    help="Append shadow candidate features and resolved labels for p_fill calibration.",
+)
+@click.option("--candidate-sample-interval-ms", type=int, default=1000, show_default=True, help="Minimum shadow candidate sample spacing per asset.")
+@click.option("--maker-fill-latency-ms", type=int, default=250, show_default=True, help="Minimum latency before a future opposite trade can count as maker fill evidence.")
+@click.option("--maker-fill-trade-through-ticks", type=float, default=1.0, show_default=True, help="Required trade-through beyond maker quote, in ticks.")
 def main(
     model,
     model_dir,
@@ -460,6 +482,10 @@ def main(
     max_spread,
     max_entries_per_signal_key,
     signal_sample_path,
+    candidate_sample_path,
+    candidate_sample_interval_ms,
+    maker_fill_latency_ms,
+    maker_fill_trade_through_ticks,
 ):
     """Start live prediction pipeline with outcome monitoring."""
     asyncio.run(run_pipeline(
@@ -486,6 +512,10 @@ def main(
         max_spread=max_spread,
         max_entries_per_signal_key=max_entries_per_signal_key,
         signal_sample_path=signal_sample_path,
+        candidate_sample_path=candidate_sample_path,
+        candidate_sample_interval_ms=candidate_sample_interval_ms,
+        maker_fill_latency_ms=maker_fill_latency_ms,
+        maker_fill_trade_through_ticks=maker_fill_trade_through_ticks,
     ))
 
 

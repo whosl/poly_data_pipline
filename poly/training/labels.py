@@ -98,13 +98,16 @@ def add_two_leg_maker_fill_labels(
     max_total_price: float,
     no_fill_edge: float = -1.0,
     maker_fill_trade_side: str = "SELL",
+    maker_fill_latency_ms: int = 250,
+    maker_fill_trade_through_ticks: float = 1.0,
+    tick_size_fallback: float = 0.01,
 ) -> pl.DataFrame:
     """Label whether a taker first leg plus future opposite maker fill clears max total price.
 
     The first leg is a taker buy at this row's `best_ask`. The second leg is a
-    maker buy on the opposite outcome in the same market. The first implementation
-    treats a future opposite-side trade with `side == maker_fill_trade_side` as
-    fill evidence and uses the lowest such trade price within the horizon.
+    maker buy on the opposite outcome in the same market. A future opposite-side
+    public trade is conservative fill evidence only after the configured latency
+    and only if it trades through the maker quote by the configured tick count.
     """
     fill_price_col = f"future_opposite_maker_fill_price_{horizon_seconds}s"
     fill_ts_col = f"future_opposite_maker_fill_recv_ns_{horizon_seconds}s"
@@ -122,6 +125,9 @@ def add_two_leg_maker_fill_labels(
     n = working.height
     fill_prices = np.full(n, np.nan, dtype=float)
     fill_times = np.full(n, -1, dtype=np.int64)
+    latency_ns = max(0, int(maker_fill_latency_ms)) * 1_000_000
+    horizon_ns = horizon_seconds * 1_000_000_000
+    effective_horizon_ns = max(0, horizon_ns - latency_ns)
 
     if trades is not None and not trades.is_empty():
         side = maker_fill_trade_side.upper()
@@ -142,22 +148,57 @@ def add_two_leg_maker_fill_labels(
             if event_array is None or len(event_array) == 0:
                 continue
             row_idx = group["_row_nr"].to_numpy()
-            query_times = group["recv_ns"].to_numpy()
+            query_times = group["recv_ns"].to_numpy() + latency_ns
             prices, times = future_window_min_prices(
                 event_array[:, 0].astype(np.int64),
                 event_array[:, 1].astype(float),
                 query_times.astype(np.int64),
-                horizon_ns,
+                effective_horizon_ns,
             )
             fill_prices[row_idx] = prices
             fill_times[row_idx] = times
+
+    candidate_fill_price_col = "_candidate_opposite_maker_fill_price"
+    candidate_fill_ts_col = "_candidate_opposite_maker_fill_recv_ns"
+    fill_threshold_col = "_opposite_maker_fill_threshold"
+    quote_col = "_opposite_maker_quote_price"
+    tick_col = "_maker_fill_tick_size"
+    fill_epsilon = 1e-12
+    tick_expr = (
+        pl.when(pl.col("tick_size").is_not_null() & (pl.col("tick_size") > 0))
+        .then(pl.col("tick_size"))
+        .otherwise(pl.lit(tick_size_fallback))
+        if "tick_size" in working.columns
+        else pl.lit(tick_size_fallback)
+    )
 
     return (
         working.with_columns(
             [
                 pl.Series("opposite_asset_id", opposite_by_row),
-                pl.Series(fill_price_col, fill_prices).fill_nan(None),
-                pl.Series(fill_ts_col, fill_times).replace(-1, None),
+                pl.Series(candidate_fill_price_col, fill_prices).fill_nan(None),
+                pl.Series(candidate_fill_ts_col, fill_times).replace(-1, None),
+            ]
+        )
+        .with_columns(
+            [
+                tick_expr.alias(tick_col),
+                (pl.lit(max_total_price) - pl.col("best_ask")).alias(quote_col),
+            ]
+        )
+        .with_columns(
+            (pl.col(quote_col) - pl.lit(maker_fill_trade_through_ticks) * pl.col(tick_col)).alias(fill_threshold_col)
+        )
+        .with_columns(
+            [
+                pl.when(pl.col(candidate_fill_price_col) <= pl.col(fill_threshold_col) + pl.lit(fill_epsilon))
+                .then(pl.col(candidate_fill_price_col))
+                .otherwise(None)
+                .alias(fill_price_col),
+                pl.when(pl.col(candidate_fill_price_col) <= pl.col(fill_threshold_col) + pl.lit(fill_epsilon))
+                .then(pl.col(candidate_fill_ts_col))
+                .otherwise(None)
+                .alias(fill_ts_col),
             ]
         )
         .with_columns((pl.col("best_ask") + pl.col(fill_price_col)).alias(total_col))
@@ -172,7 +213,7 @@ def add_two_leg_maker_fill_labels(
                 (pl.col(edge_col).is_not_null() & (pl.col(edge_col) >= 0)).cast(pl.Int8).alias(binary_col),
             ]
         )
-        .drop("_row_nr")
+        .drop([candidate_fill_price_col, candidate_fill_ts_col, fill_threshold_col, quote_col, tick_col, "_row_nr"], strict=False)
     )
 
 
@@ -320,8 +361,8 @@ def maker_fill_label_design() -> dict[str, object]:
         "derivation": (
             "For each taker-entry candidate, place an opposite-side maker quote at "
             "the configured price, replay future book/trade events chronologically, "
-            "mark fill only when future trade-through or conservative queue depletion "
-            "evidence reaches the quote within the horizon, and use best bid/ask at "
-            "horizon as the forced exit fallback."
+            "mark fill only after the configured latency when future public trades "
+            "trade through the quote by the configured tick threshold, and use best "
+            "bid/ask at horizon as the forced exit fallback."
         ),
     }
