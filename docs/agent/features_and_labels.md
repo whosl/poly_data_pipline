@@ -46,6 +46,22 @@ Current limitation: true Polymarket top-N price/size levels are not preserved in
 - `spread_narrow_count_recent`
 - `realized_vol_short`
 
+### Polymarket EWMA Features
+
+Added in training_20260422. 9 features derived from Exponential Weighted Moving Averages of 3 source columns, each producing fast (span=5), slow (span=20), and diff (fast-slow) variants:
+
+- `realized_vol_short_ewma_fast`
+- `realized_vol_short_ewma_slow`
+- `realized_vol_short_ewma_diff`
+- `depth_top10_imbalance_ewma_fast`
+- `depth_top10_imbalance_ewma_slow`
+- `depth_top10_imbalance_ewma_diff`
+- `binance_return_1s_ewma_fast`
+- `binance_return_1s_ewma_slow`
+- `binance_return_1s_ewma_diff`
+
+Implementation: `poly/training/features.py` `add_ewma_features()`. Live pipeline tracks state incrementally in `poly/predict/pipeline.py` via `AssetState` dataclass.
+
 ### Polymarket Short Return
 
 - `poly_return_1s`

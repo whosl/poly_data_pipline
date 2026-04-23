@@ -26,7 +26,7 @@ Do not paste private key contents into tracked docs, chat, logs, or commits.
 - GitHub: `git@github.com:whosl/poly_data_pipline.git`
 - Local workspace used in this thread: `/Users/wenzhuolin/dev/poly/poly_trade_pipeline`
 - Main branch: `master`
-- Latest pushed commit at the time this manual was rewritten: `d13926c Prune expired UpDown subscriptions`
+- Latest pushed commit at the time this manual was rewritten: `86d8195 Add two-stage live execution policy logging`
 - Important current local state: there may be uncommitted live/shadow changes in `poly/predict/pipeline.py` and docs.
 
 Always start with:
@@ -66,16 +66,18 @@ entry filters pass
 cooldown / max-entry gates pass
 ```
 
-The most recent live policy on Ireland was deliberately conservative:
+The most recent live policy on Ireland uses the `training_20260422` artifacts with EWMA features and winsorize preprocessing:
 
 ```text
 RandomForest classifier + RandomForest unwind regressor
-pred_expected_profit >= 0.020
-p_fill >= 0.85
+pred_expected_profit >= 0.005
+p_fill >= 0.7
 pred_unwind_profit >= 0.0
 ```
 
-It produced zero signals in the latest observation window because live `p_fill` did not reach the offline threshold.
+This produced zero signals because live `p_fill` max was ~0.638 (below 0.7) and `pred_unwind_profit` max was ~-0.009 (below 0.0). A prior single-model RF run at threshold=0.67 produced 39 signals in 10 minutes but only 7.7% accuracy.
+
+Best offline models (training_20260422): XGBoost fill classifier (p>=0.7: 64.9% win, EV +0.0313) + ExtraTrees unwind regressor (rank_corr 0.201). Not yet deployed live.
 
 ## Non-Negotiable Rules
 

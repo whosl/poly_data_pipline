@@ -21,21 +21,17 @@ Last known facts:
 
 ## Current Online Model
 
-Last observed live command:
+Latest live command (training_20260422 artifacts with EWMA + winsorize):
 
 ```text
 python scripts/live_predict.py \
-  --model random_forest_classifier \
-  --model-dir artifacts/training_reprofit_20260420_21_5m/fill_models \
-  --unwind-model random_forest_regressor \
-  --unwind-model-dir artifacts/training_reprofit_20260420_21_5m/unwind_models \
-  --threshold 0.020 \
-  --min-p-fill 0.85 \
+  --model-path artifacts/training_20260422/fill_models/random_forest_classifier.joblib \
+  --unwind-model-path artifacts/training_20260422/unwind_models/random_forest_regressor.joblib \
+  --threshold 0.005 \
+  --min-p-fill 0.7 \
   --min-pred-unwind-profit 0.0 \
   --sample-interval 100 \
   --horizon 10 \
-  --signal-cooldown 10 \
-  --max-entries-per-signal-key 3 \
   --stats-interval 1000 \
   --min-entry-ask 0.05 \
   --max-entry-ask 0.95 \
@@ -44,7 +40,9 @@ python scripts/live_predict.py \
   --symbols btcusdt
 ```
 
-This policy was chosen because offline RF+RF had a better balance of test entries and positive average than the very sparse XGBoost strict policy.
+Previous policy used `training_reprofit_20260420_21_5m` artifacts with `threshold=0.020, min_p_fill=0.85` but produced 0 signals because live p_fill max was ~0.74.
+
+Best offline models (not yet deployed): XGBoost fill classifier (p>=0.7: 64.9% win, EV +0.0313) + ExtraTrees unwind regressor (rank_corr 0.201).
 
 ## Log Events
 
@@ -120,27 +118,7 @@ Observed live failure pattern:
 - unwind losses often around `-0.03` to `-0.05`
 - some extreme price entries had much worse tails
 
-XGBoost two-stage strict:
-
-```text
-pred_expected_profit >= 0.020814
-p_fill >= 0.85
-pred_unwind_profit >= 0
-```
-
-Live result: almost no signals.
-
-XGBoost two-stage probe:
-
-```text
-pred_expected_profit >= 0.010
-p_fill >= 0.65
-pred_unwind_profit >= -0.02
-```
-
-Live result: produced signals but was negative; early run around 50 closed signals averaged about `-0.0259`.
-
-Current RF+RF:
+### Previous RF+RF (training_reprofit_20260420_21_5m)
 
 ```text
 pred_expected_profit >= 0.020
@@ -148,7 +126,41 @@ p_fill >= 0.85
 pred_unwind_profit >= 0
 ```
 
-Latest observation: zero signals after about 9,000 predictions because live `p_fill` max was around 0.74.
+Result: zero signals after ~9,000 predictions. Live p_fill max ~0.74.
+
+### XGBoost two-stage strict (older artifacts)
+
+```text
+pred_expected_profit >= 0.020814
+p_fill >= 0.85
+pred_unwind_profit >= 0
+```
+
+Result: almost no signals.
+
+### XGBoost two-stage probe (older artifacts)
+
+```text
+pred_expected_profit >= 0.010
+p_fill >= 0.65
+pred_unwind_profit >= -0.02
+```
+
+Result: produced signals but negative; ~50 closed signals averaged about `-0.0259`.
+
+### Single-model RF (training_20260422, threshold=0.67)
+
+Result: 39 signals in 10 minutes, 7.7% accuracy (3/39 profitable), total profit -1.23.
+
+### Two-stage RF+RF (training_20260422, threshold=0.005)
+
+```text
+pred_expected_profit >= 0.005
+p_fill >= 0.7
+pred_unwind_profit >= 0.0
+```
+
+Result: 0 signals after 2000 predictions. Live p_fill max 0.638 (below 0.7), pred_unwind_profit max -0.009 (below 0.0). Train/test distribution shift suspected.
 
 ## How To Check Status
 

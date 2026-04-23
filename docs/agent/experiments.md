@@ -136,3 +136,72 @@ The current evidence says:
 - expected-profit policies need better fill and unwind labels
 
 Do not infer production edge from any single table above.
+
+## training_20260422: EWMA + Winsorize + Time-Bucket
+
+Dataset:
+- `artifacts/training_20260422/alpha_dataset_5m.parquet`
+- rows: 674,889
+- features: 118 (including 9 EWMA features)
+- markets: 355
+- symbol: BTC only
+- dates: `20260420`, `20260421`
+- split: chronological 70/15/15, purge=0, embargo=0
+- preprocessing: winsorize (q0.005/q0.995), time-bucket 250ms downsampling
+
+Artifacts:
+- fill models: `artifacts/training_20260422/fill_models/`
+- unwind models: `artifacts/training_20260422/unwind_models/`
+
+### Fill Classifier Results (target: y_two_leg_entry_10s)
+
+The table below is from `artifacts/training_20260422/fill_evaluation/summary_metrics.json`.
+An earlier version of this doc had a transcription error where XGBoost `p>=0.6`
+showed fewer entries than `p>=0.7`; the artifact itself is monotonic.
+
+**ExtraTrees classifier:**
+| Threshold | Entries | Win Rate | Avg Profit |
+| ---: | ---: | ---: | ---: |
+| 0.5 | 48860 | 38.1% | -0.0197 |
+| 0.6 | 17276 | 45.8% | -0.0067 |
+| 0.7 | 3426 | 57.8% | +0.0176 |
+
+**LightGBM classifier:**
+| Threshold | Entries | Win Rate | Avg Profit |
+| ---: | ---: | ---: | ---: |
+| 0.5 | 50569 | 37.5% | -0.0214 |
+| 0.6 | 26017 | 42.9% | -0.0138 |
+| 0.7 | 10921 | 49.6% | -0.0026 |
+
+**RandomForest classifier:**
+| Threshold | Entries | Win Rate | Avg Profit |
+| ---: | ---: | ---: | ---: |
+| 0.5 | 46734 | 38.6% | -0.0191 |
+| 0.6 | 19284 | 45.4% | -0.0085 |
+| 0.7 | 6191 | 54.1% | +0.0075 |
+
+**XGBoost classifier:**
+| Threshold | Entries | Win Rate | Avg Profit |
+| ---: | ---: | ---: | ---: |
+| 0.5 | 10052 | 50.6% | -0.0006 |
+| 0.6 | 4240 | 57.0% | +0.0109 |
+| 0.7 | 1540 | 64.9% | +0.0313 |
+
+Best: XGBoost at p>=0.7 (1540 entries, 64.9% win, EV +0.0313).
+
+### Unwind Regressor Results (target: first_unwind_profit_proxy_10s)
+
+| Model | MAE | RMSE | Rank Corr | Pred>=0 entries | Pred>=0 win | Pred>=0 avg |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ExtraTrees | 0.058 | 0.084 | 0.201 | 3676 | 54.7% | +0.0163 |
+| RandomForest | 0.058 | 0.085 | 0.189 | 5463 | 48.8% | +0.0075 |
+| XGBoost | 0.058 | 0.084 | 0.193 | 5828 | 48.2% | +0.0085 |
+| LightGBM | 0.060 | 0.086 | 0.174 | 6660 | 44.2% | +0.0014 |
+
+Best: ExtraTrees (rank_corr 0.201, best win rate at pred>=0).
+
+### Live Results (Ireland)
+
+Single-model RF at threshold=0.67: 39 signals in 10 minutes, 7.7% accuracy (3/39 profitable), total profit -1.23.
+
+Two-stage RF+RF at threshold=0.005, min_p_fill=0.7, min_pred_unwind_profit=0.0: 0 signals after 2000 predictions. Live p_fill max 0.638, pred_unwind_profit max -0.009.

@@ -137,6 +137,32 @@ Tokyo S3 context from the user:
 
 Do not place AWS credentials in tracked docs.
 
+## WebSocket Ping Behavior
+
+All Polymarket WebSocket clients use `ping_interval=None` (no library-level ping). The Polymarket server does NOT respond to WebSocket ping frames or text "PING" messages. Connections last 2-3 minutes on Ireland (few subscribed markets). Tokyo connections are more stable due to higher message volume from many subscribed markets.
+
+Relevant commits: `756511d`, `f7a0b4f`
+
+Affected files:
+- `poly/collector/updown_ws.py`
+- `poly/collector/market_ws.py`
+- `poly/collector/user_ws.py`
+- `scripts/live_predict.py`
+
+## Data Filtering / Sampled Book
+
+For training, raw normalized data is downsampled using time-bucket mode:
+
+```bash
+python scripts/build_sampled_book.py --mode time-bucket --sample-interval-ms 250 --overwrite --dates 20260420 20260421
+```
+
+- 250ms buckets, keep last row per bucket per (market, outcome)
+- Compression: 123M → 1.39M rows (1.1% ratio)
+- Runs in seconds
+
+`time-bucket` is the script default. Event-driven mode with tiered magnitude filtering exists but is impractical for full-day datasets (>1.5 hours on 123M rows).
+
 ## Safe Operational Habits
 
 - Use `kill -INT` for collectors so writers can flush.

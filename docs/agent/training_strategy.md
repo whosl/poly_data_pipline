@@ -84,19 +84,21 @@ Current live signal gates:
 - signal cooldown
 - max entries per signal key
 
-The current online RF+RF policy uses:
+The current online RF+RF policy (training_20260422 artifacts) uses:
 
 ```text
-threshold = 0.020
-min_p_fill = 0.85
+threshold = 0.005
+min_p_fill = 0.7
 min_pred_unwind_profit = 0.0
 min_entry_ask = 0.05
 max_entry_ask = 0.95
 min_time_to_expiry = 20
 max_spread = 0.05
-signal_cooldown = 10
-max_entries_per_signal_key = 3
+signal_cooldown = 10 (defaults to horizon)
+max_entries_per_signal_key = 0 (unlimited)
 ```
+
+Previous policy (training_reprofit_20260420_21_5m artifacts) used `threshold=0.020, min_p_fill=0.85` but produced 0 signals because live p_fill max was ~0.74.
 
 ## Split Discipline
 
@@ -133,7 +135,56 @@ Do not add deep learning yet. The bottleneck is label realism and offline/live a
 
 ## Core Commands
 
-Build features:
+### Latest training_20260422 pipeline
+
+Build sampled book (time-bucket 250ms):
+
+```bash
+python scripts/build_sampled_book.py --mode time-bucket --sample-interval-ms 250 --overwrite --dates 20260420 20260421
+```
+
+Build features with EWMA + winsorize:
+
+```bash
+python scripts/build_features.py \
+  --data-dir data \
+  --dates 20260420 20260421 \
+  --output-dir artifacts/training_20260422 \
+  --sample-interval-ms 100
+```
+
+Filter to 5m only:
+
+```bash
+python scripts/filter_dataset.py \
+  --input artifacts/training_20260422/alpha_dataset.parquet \
+  --output artifacts/training_20260422/alpha_dataset_5m.parquet \
+  --period 5m
+```
+
+Train fill classifiers:
+
+```bash
+python scripts/train_alpha_model.py \
+  --dataset artifacts/training_20260422/alpha_dataset_5m.parquet \
+  --output-dir artifacts/training_20260422/fill_models \
+  --target-reg first_unwind_profit_proxy_10s \
+  --target-cls y_two_leg_entry_10s \
+  --models random_forest_classifier extra_trees_classifier lightgbm_classifier xgboost_classifier
+```
+
+Train unwind regressors:
+
+```bash
+python scripts/train_alpha_model.py \
+  --dataset artifacts/training_20260422/alpha_dataset_5m.parquet \
+  --output-dir artifacts/training_20260422/unwind_models \
+  --target-reg first_unwind_profit_proxy_10s \
+  --target-cls y_two_leg_entry_10s \
+  --models random_forest_regressor extra_trees_regressor lightgbm_regressor xgboost_regressor
+```
+
+### Previous training_reprofit_20260420_21_5m pipeline
 
 ```bash
 python scripts/build_features.py \
@@ -141,32 +192,6 @@ python scripts/build_features.py \
   --dates 20260420 20260421 \
   --output-dir artifacts/training_reprofit_20260420_21_5m \
   --sample-interval-ms 100
-```
-
-Train fill classifiers:
-
-```bash
-python scripts/train_alpha_model.py \
-  --dataset artifacts/training_reprofit_20260420_21_5m/alpha_dataset.parquet \
-  --output-dir artifacts/training_reprofit_20260420_21_5m/fill_models \
-  --target-reg first_unwind_profit_proxy_10s \
-  --target-cls y_two_leg_entry_10s \
-  --models random_forest_classifier extra_trees_classifier lightgbm_classifier xgboost_classifier \
-  --split-purge-ms 10000 \
-  --split-embargo-ms 10000
-```
-
-Train unwind regressors:
-
-```bash
-python scripts/train_alpha_model.py \
-  --dataset artifacts/training_reprofit_20260420_21_5m/alpha_dataset.parquet \
-  --output-dir artifacts/training_reprofit_20260420_21_5m/unwind_models \
-  --target-reg first_unwind_profit_proxy_10s \
-  --target-cls y_two_leg_entry_10s \
-  --models random_forest_regressor extra_trees_regressor lightgbm_regressor xgboost_regressor \
-  --split-purge-ms 10000 \
-  --split-embargo-ms 10000
 ```
 
 Select two-stage policy:

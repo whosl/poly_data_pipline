@@ -216,3 +216,90 @@ unwind_profit = second_leg_size * future_same_leg_best_bid - first_leg_price
 This can be positive when the first leg moves favorably even if the second leg never fills.
 
 The current formula is documented in [Training Strategy](training_strategy.md).
+
+## EWMA Features
+
+Added 9 EWMA (Exponential Weighted Moving Average) features to capture trend/momentum signals:
+
+| Source column | Fast (span=5) | Slow (span=20) | Diff (fast-slow) |
+| --- | --- | --- | --- |
+| `realized_vol_short` | `realized_vol_short_ewma_fast` | `realized_vol_short_ewma_slow` | `realized_vol_short_ewma_diff` |
+| `depth_top10_imbalance` | `depth_top10_imbalance_ewma_fast` | `depth_top10_imbalance_ewma_slow` | `depth_top10_imbalance_ewma_diff` |
+| `binance_return_1s` | `binance_return_1s_ewma_fast` | `binance_return_1s_ewma_slow` | `binance_return_1s_ewma_diff` |
+
+Implementation: `poly/training/features.py` `add_ewma_features()` with `_EWMA_SOURCE_COLUMNS` dict. Called in `build_date_dataset()` after `add_binance_features()`.
+
+Live pipeline tracks EWMA state incrementally via `AssetState` dataclass in `poly/predict/pipeline.py`, using `_ewma_update()` helper. Avoids lookback bias by computing EWMA only from current + past values.
+
+## Winsorize Preprocessing
+
+Added winsorization (quantile clipping) for features: clips values to [q0.005, q0.995] bounds fitted on training data. Prevents extreme outliers from distorting tree splits.
+
+Implemented in `poly/training/features.py`. Quantile bounds stored alongside model artifacts for live inference.
+
+## Data Filtering: Time-Bucket Downsampling
+
+Original event-driven downsampling with tiered magnitude filtering was too slow on 123M+ row datasets (>1.5 hours without completing). Switched to time-bucket mode:
+
+- 250ms buckets, keep last row per bucket per (market, outcome)
+- Compression: 123M → 1.39M rows (1.1% ratio)
+- Runs in seconds
+
+Event-driven mode is still defined in `scripts/build_sampled_book.py` with tiered filtering (Tier1: best_bid/ask/total_levels always kept; Tier2: depth imbalance/cum_depth filtered by magnitude threshold) but is impractical for full-day datasets.
+
+Relevant command:
+
+```bash
+python scripts/build_sampled_book.py --mode time-bucket --sample-interval-ms 250 --overwrite --dates 20260420 20260421
+```
+
+## WebSocket Ping Fix
+
+Ireland had 442 WS errors in 14.5 hours (connections lasting ~10s each). Tokyo had 0 errors over the same period.
+
+Root cause investigation:
+1. First attempt: enabled default library ping (removed `ping_interval=None`). Result: 68s connections. Server ignores WS ping frames, library times out.
+2. Second attempt: `ping_interval=None` + manual text "PING" heartbeat every 10s. Result: ~10s connections. Server rejects text "PING", closes connection.
+3. Final fix: `ping_interval=None` + no heartbeat. Result: 2-3 minute connections.
+
+The Polymarket server neither responds to WebSocket protocol-level ping frames nor accepts text "PING" messages. Tokyo works better because it subscribes to hundreds of markets ensuring constant message flow, preventing idle timeouts.
+
+Affected files:
+- `poly/collector/updown_ws.py`
+- `poly/collector/market_ws.py`
+- `poly/collector/user_ws.py`
+- `scripts/live_predict.py`
+
+Relevant commits: `756511d`, `f7a0b4f`
+
+## New Training Run: training_20260422
+
+New dataset with EWMA features and winsorize preprocessing:
+- `artifacts/training_20260422/alpha_dataset.parquet`: 1,340,767 rows, 181 columns (5m: 674,889, 15m: 665,878)
+- `artifacts/training_20260422/alpha_dataset_5m.parquet`: 674,889 rows, 118 feature columns, 222MB
+- Feature count: 118 (up from ~109 in training_reprofit_20260420_21_5m)
+- Split: chronological 70/15/15, purge=0, embargo=0
+
+Fill classifiers: RF, ExtraTrees, LightGBM, XGBoost
+Unwind regressors: RF, ExtraTrees, LightGBM, XGBoost
+
+Best offline results:
+- Fill: XGBoost (p>=0.7: 1540 entries, 64.9% win, EV +0.0313)
+- Unwind: ExtraTrees (rank_corr 0.201, MAE 0.058)
+
+## Live Two-Stage Model Switch (Ireland)
+
+Deployed RF classifier + RF regressor from training_20260422:
+
+```bash
+python scripts/live_predict.py \
+  --model-path artifacts/training_20260422/fill_models/random_forest_classifier.joblib \
+  --unwind-model-path artifacts/training_20260422/unwind_models/random_forest_regressor.joblib \
+  --threshold 0.005 \
+  --min-p-fill 0.7 \
+  --min-pred-unwind-profit 0.0
+```
+
+Result after 2000 predictions: 0 signals. Live p_fill max 0.638 (below 0.7), pred_unwind_profit max -0.009 (below 0.0). Train/test distribution shift suspected.
+
+Prior single-model RF run (threshold=0.67, same artifacts) produced 39 signals in 10 minutes but only 7.7% accuracy (3/39 profitable, total profit -1.23).

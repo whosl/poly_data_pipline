@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--dates", nargs="*", default=None)
-    parser.add_argument("--mode", choices=["time-bucket", "event-driven"], default="event-driven")
+    parser.add_argument("--mode", choices=["time-bucket", "event-driven"], default="time-bucket")
     parser.add_argument("--sample-interval-ms", type=int, default=250,
                         help="Bucket width for time-bucket mode (ignored in event-driven mode)")
     parser.add_argument("--event-columns", nargs="*", default=None,

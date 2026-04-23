@@ -14,6 +14,8 @@ Focus on:
 - unwind tail misses
 - score distribution drift between offline validation and live
 
+The training_20260422 two-stage RF+RF model showed live p_fill max 0.638 vs offline 0.7+ threshold. This distribution shift must be understood before tuning thresholds further.
+
 This is the highest-value task.
 
 ## 2. Build Queue-Aware Second-Leg Fill Labels
@@ -36,7 +38,17 @@ Current fill labels are too optimistic. Upgrade them to a conservative replay:
 
 Do not guess these from current state only.
 
-## 3. Add Validation-Tested Live Filters
+## 3. Deploy Best Offline Models Live
+
+Best offline models from training_20260422 are not yet deployed:
+
+- XGBoost fill classifier (p>=0.7: 64.9% win, EV +0.0313)
+- ExtraTrees unwind regressor (rank_corr 0.201)
+
+Try deploying XGBoost+ExtraTrees with relaxed thresholds (e.g. threshold=0.005, min_p_fill=0.5, min_pred_unwind_profit=-0.02) to observe live score distributions before tightening.
+
+## 4. Add Validation-Tested Live Filters
+
 
 Candidate filters:
 
@@ -49,7 +61,7 @@ Candidate filters:
 
 Each filter must be selected on validation and then frozen for test. Do not tune by live or test anecdotes alone.
 
-## 4. Store True Polymarket Top-N Depth
+## 5. Store True Polymarket Top-N Depth
 
 Normalized Polymarket L2 currently lacks full top-N price/size levels. Add either columns or a nested/list table for:
 
@@ -63,7 +75,7 @@ Normalized Polymarket L2 currently lacks full top-N price/size levels. Add eithe
 
 This should replace current proxy depth features.
 
-## 5. Harden Leakage Tests
+## 6. Harden Leakage Tests
 
 Add tests that fail if feature inference includes:
 
@@ -77,7 +89,7 @@ Add tests that fail if feature inference includes:
 
 Also test purge/embargo boundaries.
 
-## 6. Collect More Fresh Data
+## 7. Collect More Fresh Data
 
 Let Tokyo collect longer BTC-only compact-depth data.
 
@@ -92,7 +104,7 @@ python -m poly.main labels YYYYMMDD
 
 Rerun strict experiments across full days and walk-forward windows.
 
-## 7. Compare Depth Policies Again
+## 8. Compare Depth Policies Again
 
 Only after enough fresh data:
 
@@ -104,7 +116,7 @@ Only after enough fresh data:
 
 Do not delete depth collection solely because one small recovered slice was negative.
 
-## 8. Improve Feature Calibration
+## 9. Improve Feature Calibration
 
 Track and compare offline vs live distributions:
 
@@ -119,7 +131,7 @@ Track and compare offline vs live distributions:
 
 If distributions drift, add calibration or reject out-of-distribution live samples.
 
-## 9. Only Then Tune Models
+## 10. Only Then Tune Models
 
 Model complexity is not the current bottleneck. Once labels and validation are stronger, revisit:
 
