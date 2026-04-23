@@ -113,6 +113,7 @@ def build_date_dataset(
         canonicalize_trades(get_frame(tables, "binance_trades")),
         config.join_tolerance_ms,
     )
+    samples = add_ewma_features(samples)
     samples = add_research_buckets(samples, get_frame(tables, "poly_enriched_book"), config.join_tolerance_ms)
     samples = add_future_book_labels(samples, book, [1, 3, 5, 10], config.join_tolerance_ms)
     samples = add_alpha_labels(
@@ -733,6 +734,67 @@ def add_binance_features(
         ]
     )
     return df
+
+
+# ---------------------------------------------------------------------------
+# EWMA features — smooth noisy signals with fast/slow exponential moving averages
+# ---------------------------------------------------------------------------
+_EWMA_SOURCE_COLUMNS = {
+    # source_column: (fast_span, slow_span)
+    "realized_vol_short": (5, 20),
+    "depth_top10_imbalance": (5, 20),
+    "binance_return_1s": (5, 20),
+}
+
+
+def add_ewma_features(samples: pl.DataFrame) -> pl.DataFrame:
+    """Add fast/slow EWMA smoothed versions of noisy features.
+
+    For each source column, produces:
+      - ``{col}_ewma_fast``  (span=5,  ~500ms half-life at 100ms sampling)
+      - ``{col}_ewma_slow``  (span=20, ~2s half-life at 100ms sampling)
+      - ``{col}_ewma_diff``  (fast − slow, trend signal)
+
+    Computed per (market_id, asset_id) group to avoid cross-contamination.
+    """
+    df = samples
+    # Only process columns that exist in the frame
+    active_sources = {col: spans for col, spans in _EWMA_SOURCE_COLUMNS.items() if col in df.columns}
+    if not active_sources:
+        return df
+
+    group_cols = [c for c in ["market_id", "asset_id"] if c in df.columns]
+    if not group_cols:
+        # No grouping key — compute globally (unlikely in practice)
+        for col, (fast_span, slow_span) in active_sources.items():
+            df = df.with_columns(
+                [
+                    pl.col(col).ewm_mean(span=fast_span, ignore_nulls=True).alias(f"{col}_ewma_fast"),
+                    pl.col(col).ewm_mean(span=slow_span, ignore_nulls=True).alias(f"{col}_ewma_slow"),
+                ]
+            )
+            df = df.with_columns(
+                (pl.col(f"{col}_ewma_fast") - pl.col(f"{col}_ewma_slow")).alias(f"{col}_ewma_diff")
+            )
+        return df
+
+    # Partition by group, compute EWMA within each, concatenate
+    sorted_df = df.sort([*group_cols, "recv_ns"])
+    partitions = sorted_df.partition_by(group_cols, as_dict=False)
+    parts: list[pl.DataFrame] = []
+    for part in partitions:
+        for col, (fast_span, slow_span) in active_sources.items():
+            part = part.with_columns(
+                [
+                    pl.col(col).ewm_mean(span=fast_span, ignore_nulls=True).alias(f"{col}_ewma_fast"),
+                    pl.col(col).ewm_mean(span=slow_span, ignore_nulls=True).alias(f"{col}_ewma_slow"),
+                ]
+            )
+            part = part.with_columns(
+                (pl.col(f"{col}_ewma_fast") - pl.col(f"{col}_ewma_slow")).alias(f"{col}_ewma_diff")
+            )
+        parts.append(part)
+    return pl.concat(parts).sort("recv_ns")
 
 
 def empty_binance_feature_exprs() -> list[pl.Expr]:

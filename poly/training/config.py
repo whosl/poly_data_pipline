@@ -44,6 +44,8 @@ class TrainConfig:
     split_embargo_ms: int = 0
     random_seed: int = 42
     sample_weight_col: str | None = None
+    winsorize_lower: float | None = None
+    winsorize_upper: float | None = None
     models: list[str] = field(
         default_factory=lambda: [
             "logistic_regression",

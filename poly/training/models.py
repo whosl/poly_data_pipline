@@ -8,15 +8,42 @@ import importlib
 import importlib.util
 
 import joblib
+import numpy as np
 import polars as pl
 import structlog
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 
 from poly.training.config import TrainConfig, dataclass_to_json_dict, save_json
 from poly.training.features import infer_feature_columns
 from poly.training.splits import chronological_split, split_ranges
 
 logger = structlog.get_logger()
+
+
+class Winsorizer(TransformerMixin, BaseEstimator):
+    """Clip features to quantile bounds fitted on training data.
+
+    Parameters
+    ----------
+    lower_quantile : float
+        Lower bound quantile (e.g. 0.005 for 0.5th percentile).
+    upper_quantile : float
+        Upper bound quantile (e.g. 0.995 for 99.5th percentile).
+    """
+
+    def __init__(self, lower_quantile: float = 0.005, upper_quantile: float = 0.995):
+        self.lower_quantile = lower_quantile
+        self.upper_quantile = upper_quantile
+
+    def fit(self, X, y=None):
+        X = np.asarray(X, dtype=np.float64)
+        self.lower_ = np.nanpercentile(X, self.lower_quantile * 100, axis=0)
+        self.upper_ = np.nanpercentile(X, self.upper_quantile * 100, axis=0)
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        return np.clip(X, self.lower_, self.upper_)
 
 
 @dataclass
@@ -58,8 +85,13 @@ def train_baselines(config: TrainConfig) -> TrainedArtifacts:
     if train_df.is_empty():
         raise ValueError("training split is empty after dropping missing targets")
 
-    preprocessor = make_preprocessor(numeric_columns, categorical_columns, scale_numeric=True)
-    tree_preprocessor = make_preprocessor(numeric_columns, categorical_columns, scale_numeric=False)
+    winsorize_quantiles = None
+    if config.winsorize_lower is not None and config.winsorize_upper is not None:
+        winsorize_quantiles = (config.winsorize_lower, config.winsorize_upper)
+        logger.info("winsorize_enabled", lower=config.winsorize_lower, upper=config.winsorize_upper)
+
+    preprocessor = make_preprocessor(numeric_columns, categorical_columns, scale_numeric=True, winsorize_quantiles=winsorize_quantiles)
+    tree_preprocessor = make_preprocessor(numeric_columns, categorical_columns, scale_numeric=False, winsorize_quantiles=winsorize_quantiles)
 
     model_specs: dict[str, tuple[str, object]] = {
         "linear_regression": ("regression", Pipeline([("prep", preprocessor), ("model", LinearRegression())])),
@@ -347,6 +379,7 @@ def make_preprocessor(
     numeric_columns: list[str],
     categorical_columns: list[str],
     scale_numeric: bool,
+    winsorize_quantiles: tuple[float, float] | None = None,
 ):
     from sklearn.compose import ColumnTransformer
     from sklearn.impute import SimpleImputer
@@ -355,7 +388,10 @@ def make_preprocessor(
 
     transformers = []
     if numeric_columns:
-        steps = [("imputer", SimpleImputer(strategy="median"))]
+        steps: list[tuple[str, object]] = [("imputer", SimpleImputer(strategy="median"))]
+        if winsorize_quantiles is not None:
+            lower, upper = winsorize_quantiles
+            steps.append(("winsorizer", Winsorizer(lower_quantile=lower, upper_quantile=upper)))
         if scale_numeric:
             steps.append(("scaler", StandardScaler()))
         transformers.append(("numeric", Pipeline(steps), numeric_columns))

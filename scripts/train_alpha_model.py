@@ -30,6 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-purge-ms", type=int, default=0)
     parser.add_argument("--split-embargo-ms", type=int, default=0)
     parser.add_argument("--sample-weight-col", default=None)
+    parser.add_argument("--winsorize-lower", type=float, default=None,
+                        help="Lower quantile for winsorization (e.g. 0.005 for 0.5th percentile)")
+    parser.add_argument("--winsorize-upper", type=float, default=None,
+                        help="Upper quantile for winsorization (e.g. 0.995 for 99.5th percentile)")
     return parser.parse_args()
 
 
@@ -46,6 +50,8 @@ def main() -> None:
         split_purge_ms=args.split_purge_ms,
         split_embargo_ms=args.split_embargo_ms,
         sample_weight_col=args.sample_weight_col,
+        winsorize_lower=args.winsorize_lower,
+        winsorize_upper=args.winsorize_upper,
     )
     if args.models is not None:
         config.models = args.models

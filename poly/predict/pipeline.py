@@ -22,6 +22,19 @@ logger = structlog.get_logger()
 NS_PER_MS = 1_000_000
 NS_PER_SECOND = 1_000_000_000
 
+# EWMA decay factors: alpha = 2 / (span + 1)
+_EWMA_ALPHA_FAST = 2.0 / (5 + 1)   # span=5,  ~500ms half-life at 100ms
+_EWMA_ALPHA_SLOW = 2.0 / (20 + 1)  # span=20, ~2s half-life at 100ms
+
+
+def _ewma_update(prev: float | None, new_val: float | None, alpha: float) -> float | None:
+    """Incrementally update an EWMA value. Returns None if new_val is None."""
+    if new_val is None:
+        return prev
+    if prev is None:
+        return new_val
+    return alpha * new_val + (1.0 - alpha) * prev
+
 
 def short_id(value: str | None, n: int = 8) -> str:
     return str(value or "")[:n]
@@ -145,6 +158,14 @@ class AssetState:
 
     # Opposite asset
     opposite_asset_id: str | None = None
+
+    # EWMA state for smoothed features (fast span=5, slow span=20)
+    realized_vol_ewma_fast: float | None = None
+    realized_vol_ewma_slow: float | None = None
+    depth_top10_imbalance_ewma_fast: float | None = None
+    depth_top10_imbalance_ewma_slow: float | None = None
+    binance_return_1s_ewma_fast: float | None = None
+    binance_return_1s_ewma_slow: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +324,37 @@ class LiveFeatureAssembler:
         features["lead_lag_binance_minus_poly_500ms"] = features.get("binance_return_500ms", 0.0) - (
             (mid_vals[-1] - mid_vals[-6]) / mid_vals[-6] if len(mid_vals) >= 6 and mid_vals[-6] > 0 else 0.0
         )
+
+        # --- EWMA features (incremental update on asset state) ---
+        rv = features.get("realized_vol_short")
+        asset.realized_vol_ewma_fast = _ewma_update(asset.realized_vol_ewma_fast, rv, _EWMA_ALPHA_FAST)
+        asset.realized_vol_ewma_slow = _ewma_update(asset.realized_vol_ewma_slow, rv, _EWMA_ALPHA_SLOW)
+        features["realized_vol_ewma_fast"] = asset.realized_vol_ewma_fast
+        features["realized_vol_ewma_slow"] = asset.realized_vol_ewma_slow
+        if asset.realized_vol_ewma_fast is not None and asset.realized_vol_ewma_slow is not None:
+            features["realized_vol_ewma_diff"] = asset.realized_vol_ewma_fast - asset.realized_vol_ewma_slow
+        else:
+            features["realized_vol_ewma_diff"] = None
+
+        d10i = asset.depth_features.get("depth_top10_imbalance")
+        asset.depth_top10_imbalance_ewma_fast = _ewma_update(asset.depth_top10_imbalance_ewma_fast, d10i, _EWMA_ALPHA_FAST)
+        asset.depth_top10_imbalance_ewma_slow = _ewma_update(asset.depth_top10_imbalance_ewma_slow, d10i, _EWMA_ALPHA_SLOW)
+        features["depth_top10_imbalance_ewma_fast"] = asset.depth_top10_imbalance_ewma_fast
+        features["depth_top10_imbalance_ewma_slow"] = asset.depth_top10_imbalance_ewma_slow
+        if asset.depth_top10_imbalance_ewma_fast is not None and asset.depth_top10_imbalance_ewma_slow is not None:
+            features["depth_top10_imbalance_ewma_diff"] = asset.depth_top10_imbalance_ewma_fast - asset.depth_top10_imbalance_ewma_slow
+        else:
+            features["depth_top10_imbalance_ewma_diff"] = None
+
+        br1 = features.get("binance_return_1s")
+        asset.binance_return_1s_ewma_fast = _ewma_update(asset.binance_return_1s_ewma_fast, br1, _EWMA_ALPHA_FAST)
+        asset.binance_return_1s_ewma_slow = _ewma_update(asset.binance_return_1s_ewma_slow, br1, _EWMA_ALPHA_SLOW)
+        features["binance_return_1s_ewma_fast"] = asset.binance_return_1s_ewma_fast
+        features["binance_return_1s_ewma_slow"] = asset.binance_return_1s_ewma_slow
+        if asset.binance_return_1s_ewma_fast is not None and asset.binance_return_1s_ewma_slow is not None:
+            features["binance_return_1s_ewma_diff"] = asset.binance_return_1s_ewma_fast - asset.binance_return_1s_ewma_slow
+        else:
+            features["binance_return_1s_ewma_diff"] = None
 
         # --- Categorical buckets (simple thresholds) ---
         imb = features.get("top1_imbalance", 0.0) or 0.0
