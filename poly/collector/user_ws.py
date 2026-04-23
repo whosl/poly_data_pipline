@@ -47,7 +47,7 @@ class PolymarketUserWS:
         url = self.config.poly_user_ws_url
         logger.info("user_ws_connecting", url=url)
 
-        async with websockets.connect(url) as ws:
+        async with websockets.connect(url, ping_interval=None) as ws:
             auth_msg = orjson.dumps({
                 "auth": {
                     "apiKey": self.config.api_key,
@@ -66,6 +66,8 @@ class PolymarketUserWS:
                 })
                 await ws.send(sub)
 
+            heartbeat_task = asyncio.create_task(self._heartbeat(ws))
+
             try:
                 async for message in ws:
                     import poly_core
@@ -73,8 +75,16 @@ class PolymarketUserWS:
                     self._msg_count += 1
                     await self.raw_writer.write(message, recv_ns)
 
+                    if isinstance(message, bytes):
+                        text = message.decode("utf-8", errors="replace")
+                    else:
+                        text = message
+                    text = text.strip()
+                    if not text or text == "PONG":
+                        continue
+
                     try:
-                        msg = orjson.loads(message)
+                        msg = orjson.loads(text)
                     except Exception:
                         continue
 
@@ -84,7 +94,17 @@ class PolymarketUserWS:
                     elif event_type == "trade":
                         self._handle_trade(msg, recv_ns)
             finally:
-                pass
+                heartbeat_task.cancel()
+
+    async def _heartbeat(self, ws) -> None:
+        """Send periodic text PING to keep NAT mapping alive."""
+        interval = self.config.ws_ping_interval
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await ws.send("PING")
+            except Exception:
+                return
 
     def _handle_order(self, msg: dict, recv_ns: int) -> None:
         order_id = msg.get("id", "")

@@ -68,7 +68,7 @@ class PolymarketMarketWS:
         url = self.config.poly_market_ws_url
         logger.info("market_ws_connecting", url=url, num_assets=len(asset_ids))
 
-        async with websockets.connect(url) as ws:
+        async with websockets.connect(url, ping_interval=None) as ws:
             self._ws = ws
             # Subscribe (limit to 100 per connection for stability)
             sub_ids = asset_ids[:100]
@@ -83,6 +83,7 @@ class PolymarketMarketWS:
             # Start background tasks
             watchdog = DataWatchdog(self.config.watchdog_timeout)
             watchdog_task = asyncio.create_task(self._watchdog_check(ws, watchdog))
+            heartbeat_task = asyncio.create_task(self._heartbeat(ws))
 
             try:
                 async for message in ws:
@@ -101,7 +102,7 @@ class PolymarketMarketWS:
                     else:
                         text = message
                     text = text.strip()
-                    if not text or text in ("PONG", "PING"):
+                    if not text or text == "PONG":
                         continue
                     try:
                         parsed = orjson.loads(text)
@@ -130,8 +131,19 @@ class PolymarketMarketWS:
                                        old=msg.get("old_tick_size"), new=msg.get("new_tick_size"))
 
             finally:
+                heartbeat_task.cancel()
                 watchdog_task.cancel()
                 self._ws = None
+
+    async def _heartbeat(self, ws) -> None:
+        """Send periodic text PING to keep NAT mapping alive."""
+        interval = self.config.ws_ping_interval
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await ws.send("PING")
+            except Exception:
+                return
 
     async def _watchdog_check(self, ws, watchdog: DataWatchdog) -> None:
         while True:
