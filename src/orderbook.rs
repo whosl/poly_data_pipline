@@ -232,6 +232,7 @@ impl OrderBook {
             dict.set_item("total_ask_levels", self.asks.len())?;
             dict.set_item("last_exchange_ts", self.last_exchange_ts)?;
             dict.set_item("asset_id", self.asset_id.as_str())?;
+            dict.set_item("full", true)?;  // marker: includes depth features
 
             // --- Top-N depth features ---
             for &n in &[1usize, 3, 5, 10, 20] {
@@ -285,6 +286,62 @@ impl OrderBook {
                 dict.set_item(format!("near_touch_bid_notional_{n}"), bid_notional.to_string())?;
                 dict.set_item(format!("near_touch_ask_notional_{n}"), ask_notional.to_string())?;
             }
+
+            Ok(dict.into())
+        })
+    }
+
+    /// Returns a lightweight summary with only O(1) fields.
+    /// No top-N iteration — much cheaper than depth_summary().
+    /// Includes a `full` key set to false so Python can distinguish it.
+    pub fn quick_summary(&self) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            let dict = pyo3::types::PyDict::new(py);
+
+            let bb = self.bids.iter().next();
+            let ba = self.asks.iter().next();
+
+            match (bb, ba) {
+                (Some((bp, bs)), Some((ap, as_))) => {
+                    dict.set_item("best_bid", bp.0.to_string())?;
+                    dict.set_item("best_bid_size", bs.to_string())?;
+                    dict.set_item("best_ask", ap.to_string())?;
+                    dict.set_item("best_ask_size", as_.to_string())?;
+
+                    let spread = *ap - bp.0;
+                    dict.set_item("spread", spread.to_string())?;
+
+                    let mid = (bp.0 + *ap) / Decimal::from(2);
+                    dict.set_item("midpoint", mid.to_string())?;
+
+                    let total = *bs + *as_;
+                    if total > Decimal::ZERO {
+                        let mp = (bp.0 * *as_ + *ap * *bs) / total;
+                        dict.set_item("microprice", mp.to_string())?;
+                        let imb = (*bs - *as_) / total;
+                        dict.set_item("imbalance", imb.to_string())?;
+                    } else {
+                        dict.set_item("microprice", py.None())?;
+                        dict.set_item("imbalance", py.None())?;
+                    }
+                }
+                _ => {
+                    dict.set_item("best_bid", py.None())?;
+                    dict.set_item("best_bid_size", py.None())?;
+                    dict.set_item("best_ask", py.None())?;
+                    dict.set_item("best_ask_size", py.None())?;
+                    dict.set_item("spread", py.None())?;
+                    dict.set_item("midpoint", py.None())?;
+                    dict.set_item("microprice", py.None())?;
+                    dict.set_item("imbalance", py.None())?;
+                }
+            }
+
+            dict.set_item("total_bid_levels", self.bids.len())?;
+            dict.set_item("total_ask_levels", self.asks.len())?;
+            dict.set_item("last_exchange_ts", self.last_exchange_ts)?;
+            dict.set_item("asset_id", self.asset_id.as_str())?;
+            dict.set_item("full", false)?;  // marker: no depth features
 
             Ok(dict.into())
         })

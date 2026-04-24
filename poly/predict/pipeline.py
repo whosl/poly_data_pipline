@@ -28,6 +28,31 @@ _EWMA_ALPHA_FAST = 2.0 / (5 + 1)   # span=5,  ~500ms half-life at 100ms
 _EWMA_ALPHA_SLOW = 2.0 / (20 + 1)  # span=20, ~2s half-life at 100ms
 
 
+def force_single_thread_inference(model: object, *, name: str) -> None:
+    """Force sklearn-compatible estimators to avoid per-row parallel overhead."""
+    if not hasattr(model, "get_params") or not hasattr(model, "set_params"):
+        return
+    try:
+        params = model.get_params(deep=True)
+    except Exception as exc:
+        logger.warning("live_model_thread_params_unavailable", model=name, error=str(exc))
+        return
+
+    updates = {
+        key: 1
+        for key, value in params.items()
+        if (key == "n_jobs" or key.endswith("__n_jobs") or key == "nthread" or key.endswith("__nthread"))
+        and value != 1
+    }
+    if not updates:
+        return
+    try:
+        model.set_params(**updates)
+        logger.info("live_model_single_threaded", model=name, updates=updates)
+    except Exception as exc:
+        logger.warning("live_model_single_thread_failed", model=name, updates=updates, error=str(exc))
+
+
 def _ewma_update(prev: float | None, new_val: float | None, alpha: float) -> float | None:
     """Incrementally update an EWMA value. Returns None if new_val is None."""
     if new_val is None:
@@ -98,6 +123,7 @@ class SignalSampleWriter:
 
     def __init__(self, path: str | Path | None):
         self.path = Path(path) if path else None
+        self._file = None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -109,11 +135,16 @@ class SignalSampleWriter:
         if self.path is None:
             return
         try:
-            with self.path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(json_safe(record), ensure_ascii=False, separators=(",", ":")))
-                f.write("\n")
+            if self._file is None or self._file.closed:
+                self._file = self.path.open("a", encoding="utf-8", buffering=1)
+            self._file.write(json.dumps(json_safe(record), ensure_ascii=False, separators=(",", ":")))
+            self._file.write("\n")
         except Exception as exc:
             logger.warning("signal_sample_write_failed", path=str(self.path), error=str(exc))
+
+    def close(self) -> None:
+        if self._file is not None and not self._file.closed:
+            self._file.close()
 
 
 # ---------------------------------------------------------------------------
@@ -125,19 +156,22 @@ class RollingWindow:
     def __init__(self, window_ns: int):
         self._window_ns = window_ns
         self._data: deque[tuple[int, float]] = deque()
+        self._sum = 0.0
 
     def add(self, ts_ns: int, value: float) -> None:
         self._data.append((ts_ns, value))
+        self._sum += value
         self._evict(ts_ns)
 
     def _evict(self, now_ns: int) -> None:
         cutoff = now_ns - self._window_ns
         while self._data and self._data[0][0] < cutoff:
-            self._data.popleft()
+            _, value = self._data.popleft()
+            self._sum -= value
 
     def sum(self, now_ns: int) -> float:
         self._evict(now_ns)
-        return sum(v for _, v in self._data)
+        return self._sum
 
     def count(self, now_ns: int) -> int:
         self._evict(now_ns)
@@ -754,11 +788,13 @@ class PredictionPipeline:
         # unwind_model_path is a signed-PnL regressor for the failure branch.
         blob = joblib.load(str(model_path))
         self.pipeline = blob["model"]
+        force_single_thread_inference(self.pipeline, name="fill")
         self.unwind_pipeline = None
         unwind_feature_cols: list[str] = []
         if unwind_model_path is not None:
             unwind_blob = joblib.load(str(unwind_model_path))
             self.unwind_pipeline = unwind_blob["model"]
+            force_single_thread_inference(self.unwind_pipeline, name="unwind")
             unwind_feature_cols = unwind_blob.get("feature_columns", [])
         model_feature_cols = blob.get("feature_columns", [])
 
@@ -808,12 +844,17 @@ class PredictionPipeline:
         self._next_candidate_id = 1
         self._last_candidate_ns_by_asset: dict[str, int] = {}
         self._score_window: deque[dict[str, float | None]] = deque(maxlen=10_000)
+        self._score_sample_interval = 5
         self._block_counts: Counter[str] = Counter()
 
     def _get_or_create_asset(self, asset_id: str) -> AssetState:
         if asset_id not in self.asset_states:
             self.asset_states[asset_id] = AssetState(asset_id=asset_id)
         return self.asset_states[asset_id]
+
+    def close(self) -> None:
+        self.signal_samples.close()
+        self.candidate_samples.close()
 
     def update_market_mapping(self, market_id: str, asset_id: str, outcome: str) -> None:
         """Update market_id -> {asset_id -> outcome} mapping."""
@@ -960,7 +1001,11 @@ class PredictionPipeline:
         asset.top1_imbalance = float(features.get("imbalance") or 0)
         asset.total_bid_levels = int(features.get("total_bid_levels") or 0)
         asset.total_ask_levels = int(features.get("total_ask_levels") or 0)
-        asset.depth_features = extract_depth_features(features)
+        # Only update depth features when full summary is available.
+        # quick_summary (full=False) skips expensive top-N iteration;
+        # keep previous depth_features cached in that case.
+        if features.get("full", True):
+            asset.depth_features = extract_depth_features(features)
 
         # Rolling windows
         asset.book_updates_100ms.add(recv_ns, 1.0)
@@ -1120,14 +1165,15 @@ class PredictionPipeline:
             and p_fill_ok
             and unwind_ok
         )
-        self._score_window.append(
-            {
-                "p_fill": float(proba),
-                "pred_unwind_profit": pred_unwind_profit,
-                "pred_expected_profit": pred_expected_profit,
-                "decision_score": float(decision_score),
-            }
-        )
+        if signal or self.monitor.stats.total_predictions % self._score_sample_interval == 0:
+            self._score_window.append(
+                {
+                    "p_fill": float(proba),
+                    "pred_unwind_profit": pred_unwind_profit,
+                    "pred_expected_profit": pred_expected_profit,
+                    "decision_score": float(decision_score),
+                }
+            )
         self._record_gate_counts(
             raw_signal=raw_signal,
             crossed_threshold=crossed_threshold,
@@ -1241,7 +1287,7 @@ class PredictionPipeline:
                 decision_score=decision_score,
                 opposite_asset_id=asset.opposite_asset_id,
                 slug=asset.slug,
-                feature_values=dict(row),
+                feature_values={},
                 fee_rate=self.fee_rate,
                 price_buffer=self.price_buffer,
                 second_leg_quote_price=second_leg_quote_price,

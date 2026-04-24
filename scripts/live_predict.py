@@ -156,8 +156,11 @@ async def run_pipeline(
         name="binance_ws",
     )
 
-    await asyncio.gather(poly_task, binance_task, return_exceptions=True)
-    logger.info("pipeline_stopped")
+    try:
+        await asyncio.gather(poly_task, binance_task, return_exceptions=True)
+    finally:
+        pipeline.close()
+        logger.info("pipeline_stopped")
 
 
 # ---------------------------------------------------------------------------

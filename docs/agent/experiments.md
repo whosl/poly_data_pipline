@@ -184,6 +184,69 @@ Early Ireland live-shadow verification:
 
 This run is encouraging but is still a small live sample. Continue candidate calibration before treating it as stable edge.
 
+### 2026-04-23 5m-Only Retrain and Live Switch Candidate
+
+New 5m-only dataset:
+
+- `artifacts/training_eventdriven_20260423_5m/alpha_dataset.parquet`
+- rows: 1,630,456
+- symbol: BTC only
+- markets: 355
+- assets: 710
+- feature columns: 118
+- split: chronological 70/15/15
+
+Single-model fill cutoff selection under live-like gating:
+
+| Fill Model | Selected Cutoff | Validation Entries | Validation Avg | Test Entries | Test Avg | Test Total | Test Success |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ExtraTrees | `0.795457` | 100 | `+0.015266` | 96 | `+0.016448` | `+1.5790` | 96.88% |
+| LightGBM | `0.900000` | 136 | `+0.018166` | 139 | `+0.015011` | `+2.0865` | 92.81% |
+| RandomForest | `0.880000` | 157 | `+0.019616` | 149 | `+0.014950` | `+2.2276` | 91.28% |
+| XGBoost | `0.800000` | 101 | `+0.019942` | 109 | `+0.007305` | `+0.7962` | 88.99% |
+
+Unwind regressor quality on the same 5m-only split:
+
+| Unwind Model | MAE | RMSE | Rank Corr |
+| --- | ---: | ---: | ---: |
+| ExtraTrees | `0.05760` | `0.08369` | `0.1990` |
+| XGBoost | `0.05767` | `0.08364` | `0.1963` |
+| RandomForest | `0.05778` | `0.08384` | `0.1937` |
+| LightGBM | `0.05931` | `0.08562` | `0.1720` |
+
+Best two-stage live-like policies on the same 5m-only split:
+
+| Fill Model | Unwind Model | Policy | Validation Entries | Validation Avg | Test Entries | Test Avg | Test Total | Test Positive |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RandomForest | XGBoost | `exp>=0.030, p_fill>=0.65, unwind>=0` | 30 | `+0.024661` | 19 | `+0.022954` | `+0.4361` | 89.47% |
+| XGBoost | ExtraTrees | `exp>=0.02692, p_fill>=0.75, unwind>=0` | 39 | `+0.022782` | 50 | `+0.019643` | `+0.9822` | 96.00% |
+| LightGBM | ExtraTrees | `exp>=0.025, p_fill>=0.85, unwind>=0` | 85 | `+0.019572` | 83 | `+0.019424` | `+1.6122` | 92.77% |
+| LightGBM | XGBoost | `exp>=0.028608, p_fill>=0.75, unwind>=0` | 46 | `+0.020969` | 33 | `+0.017772` | `+0.5865` | 84.85% |
+
+Operational decision after this run:
+
+- keep `btc-updown-5m` only on live
+- switch live fill model to `lightgbm_classifier`
+- keep live unwind model as `extra_trees_regressor`
+- set live policy to:
+  - `threshold = 0.025`
+  - `min_p_fill = 0.85`
+  - `min_pred_unwind_profit = 0.0`
+  - `max_entries_per_signal_key = 3`
+
+Reasoning:
+
+- `RandomForest + XGBoost` had the highest test average profit, but only 19 test entries.
+- `LightGBM + ExtraTrees` kept positive average profit with a larger sample and is the better first live replacement.
+
+Pre-switch Ireland live snapshot for the older event-driven pair
+(`xgboost_classifier + extra_trees_regressor`, `threshold=0.025`, `min_p_fill=0.5`, `min_pred_unwind_profit=-0.05`):
+
+- around `331` resolved signals
+- accuracy about `71.3%`
+- total profit about `+1.5502`
+- the run remained highly sensitive to unwind losses
+
 ## training_20260422: EWMA + Winsorize + Time-Bucket
 
 Dataset:

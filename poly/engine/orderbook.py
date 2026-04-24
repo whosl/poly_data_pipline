@@ -60,10 +60,19 @@ def extract_depth_features(features: dict) -> dict[str, float | None]:
 
 
 class OrderBookEngine:
-    """Manages per-asset OrderBook instances backed by Rust."""
+    """Manages per-asset OrderBook instances backed by Rust.
 
-    def __init__(self) -> None:
+    Event-driven depth_summary: only recomputes the expensive top-N depth
+    features when midpoint moves beyond ``midpoint_threshold`` (relative).
+    Otherwise returns a cheap quick_summary (O(1) fields only).
+    """
+
+    def __init__(self, midpoint_threshold: float = 0.005) -> None:
         self._books: dict[str, poly_core.OrderBook] = {}
+        # Per-asset tracking for event-driven depth recomputation.
+        self._last_mid: dict[str, float] = {}
+        self._last_summary: dict[str, dict] = {}
+        self.midpoint_threshold = midpoint_threshold
 
     def get_or_create(self, asset_id: str) -> poly_core.OrderBook:
         if asset_id not in self._books:
@@ -71,23 +80,51 @@ class OrderBookEngine:
         return self._books[asset_id]
 
     def handle_book(self, asset_id: str, bids: list, asks: list, exchange_ts: int) -> dict[str, Any] | None:
-        """Apply a full snapshot and return depth summary."""
+        """Apply a full snapshot and always return full depth summary."""
         book = self.get_or_create(asset_id)
         bids_data = [(b["price"], b["size"]) for b in bids]
         asks_data = [(a["price"], a["size"]) for a in asks]
         book.apply_snapshot(bids_data, asks_data, exchange_ts)
-        return book.depth_summary()
+        summary = book.depth_summary()
+        # Cache the full summary and midpoint.
+        mid_str = summary.get("midpoint")
+        if mid_str is not None:
+            self._last_mid[asset_id] = float(mid_str)
+        self._last_summary[asset_id] = summary
+        return summary
 
     def handle_price_change(
         self, asset_id: str, side: str, price: str, size: str, exchange_ts: int
     ) -> dict[str, Any] | None:
-        """Apply a delta and return depth summary."""
+        """Apply a delta; only recompute full depth_summary when midpoint moved."""
         book = self.get_or_create(asset_id)
         book.apply_delta(side, price, size, exchange_ts)
-        return book.depth_summary()
+
+        # Check midpoint delta vs cached value.
+        mid_str = book.midpoint()
+        if mid_str is None:
+            return book.quick_summary()
+
+        new_mid = float(mid_str)
+        prev_mid = self._last_mid.get(asset_id)
+
+        if prev_mid is not None and prev_mid > 0:
+            rel_change = abs(new_mid - prev_mid) / prev_mid
+            if rel_change < self.midpoint_threshold:
+                # Midpoint barely moved — return cheap summary.
+                return book.quick_summary()
+
+        # Midpoint moved beyond threshold (or first update) — full recompute.
+        summary = book.depth_summary()
+        self._last_mid[asset_id] = new_mid
+        self._last_summary[asset_id] = summary
+        return summary
 
     def get_features(self, asset_id: str) -> dict[str, Any] | None:
-        """Get current depth summary without updating."""
+        """Get current depth summary without updating. Returns cached if available."""
+        cached = self._last_summary.get(asset_id)
+        if cached is not None:
+            return cached
         book = self._books.get(asset_id)
         if book is None:
             return None
@@ -96,10 +133,14 @@ class OrderBookEngine:
     def remove(self, asset_id: str) -> None:
         """Drop local state for an asset that is no longer subscribed."""
         self._books.pop(asset_id, None)
+        self._last_mid.pop(asset_id, None)
+        self._last_summary.pop(asset_id, None)
 
     def clear(self) -> None:
         """Drop all local order book state after a websocket reconnect."""
         self._books.clear()
+        self._last_mid.clear()
+        self._last_summary.clear()
 
     def top_n(self, asset_id: str, n: int = 10) -> tuple[list, list] | None:
         book = self._books.get(asset_id)

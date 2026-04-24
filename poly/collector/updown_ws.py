@@ -28,13 +28,13 @@ EXPIRED_MARKET_GRACE_SECONDS = 5
 
 # Market definitions: base_slug -> (base_slug, period_seconds, subscribe_ahead_seconds)
 SUPPORTED_MARKET_DEFS = {
-    "btc-updown-5m": ("btc-updown-5m", 300, 60),   # 5-min BTC, subscribe 60s early
+    "btc-updown-5m": ("btc-updown-5m", 300, 18),   # 5-min BTC, subscribe 18s early
     "btc-updown-15m": ("btc-updown-15m", 900, 120),  # 15-min BTC, subscribe 120s early
-    "eth-updown-5m": ("eth-updown-5m", 300, 60),
+    "eth-updown-5m": ("eth-updown-5m", 300, 18),
     "eth-updown-15m": ("eth-updown-15m", 900, 120),
 }
 DEFAULT_MARKET_DEFS = [
-    ("btc-updown-5m",  300, 60),   # 5-min BTC, subscribe 60s early
+    ("btc-updown-5m",  300, 18),   # 5-min BTC, subscribe 18s early
     ("btc-updown-15m", 900, 120),  # 15-min BTC, subscribe 120s early
 ]
 

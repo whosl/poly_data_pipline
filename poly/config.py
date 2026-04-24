@@ -34,7 +34,7 @@ def get_config() -> Config:
     """Load config from environment variables with sensible defaults."""
     data_dir = Path(os.environ.get("POLY_DATA_DIR", str(_PROJECT_ROOT / "data")))
     symbols_str = os.environ.get("POLY_BINANCE_SYMBOLS", "btcusdt")
-    updown_markets_str = os.environ.get("POLY_UPDOWN_MARKETS", "btc-updown-5m,btc-updown-15m")
+    updown_markets_str = os.environ.get("POLY_UPDOWN_MARKETS", "btc-updown-5m")
     tags_str = os.environ.get("POLY_FILTER_TAGS", "bitcoin,crypto")
 
     return Config(
