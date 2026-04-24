@@ -233,6 +233,9 @@ class AssetState:
     last_sample_ns: int = 0
     sample_interval_ns: int = 100 * NS_PER_MS  # 100ms
 
+    # Price change gate: only run inference when mid moves beyond this threshold
+    last_predicted_mid: float | None = None
+
     # Opposite asset
     opposite_asset_id: str | None = None
 
@@ -762,11 +765,13 @@ class PredictionPipeline:
         candidate_sample_interval_ms: int = 1000,
         maker_fill_latency_ms: int = 250,
         maker_fill_trade_through_ticks: float = 1.0,
+        min_price_change: float = 0.02,
     ):
         self.threshold = threshold
         self.min_p_fill = min_p_fill
         self.min_pred_unwind_profit = min_pred_unwind_profit
         self.sample_interval_ns = sample_interval_ms * NS_PER_MS
+        self.min_price_change = min_price_change
         self.horizon_seconds = horizon_seconds
         self.fee_rate = fee_rate
         self.price_buffer = price_buffer
@@ -1019,6 +1024,14 @@ class PredictionPipeline:
         if recv_ns - asset.last_sample_ns < self.sample_interval_ns:
             return
         asset.last_sample_ns = recv_ns
+
+        # Price change gate: skip inference if mid hasn't moved enough
+        if self.min_price_change > 0 and asset.last_predicted_mid is not None:
+            if abs(asset.current_mid - asset.last_predicted_mid) < self.min_price_change:
+                # Mid barely moved — skip expensive feature assembly + inference
+                self._check_pending_outcomes(recv_ns)
+                return
+        asset.last_predicted_mid = asset.current_mid
 
         # Outcome checks only need current books; keep them independent from
         # model gating so pending signals still resolve when we skip inference.

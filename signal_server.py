@@ -261,6 +261,7 @@ async def run_server(
     port: int = 8765,
     maker_fill_latency_ms: int = 250,
     maker_fill_trade_through_ticks: float = 1.0,
+    min_price_change: float = 0.02,
 ):
     """Run the ML signal server: PredictionPipeline + WebSocket broadcaster."""
     import orjson
@@ -306,6 +307,7 @@ async def run_server(
         candidate_sample_path=None,
         maker_fill_latency_ms=maker_fill_latency_ms,
         maker_fill_trade_through_ticks=maker_fill_trade_through_ticks,
+        min_price_change=min_price_change,
     )
     engine = OrderBookEngine()
 
@@ -387,6 +389,7 @@ import click
 @click.option("--port", type=int, default=8765, show_default=True)
 @click.option("--maker-fill-latency-ms", type=int, default=250, show_default=True)
 @click.option("--maker-fill-trade-through-ticks", type=float, default=1.0, show_default=True)
+@click.option("--min-price-change", type=float, default=0.02, show_default=True, help="Min mid price change to trigger inference")
 def main(
     model_path,
     unwind_model_path,
@@ -408,6 +411,7 @@ def main(
     port,
     maker_fill_latency_ms,
     maker_fill_trade_through_ticks,
+    min_price_change,
 ):
     """ML Signal Server: broadcasts ML predictions to poly_bot via WebSocket."""
     asyncio.run(run_server(
@@ -431,6 +435,7 @@ def main(
         port=port,
         maker_fill_latency_ms=maker_fill_latency_ms,
         maker_fill_trade_through_ticks=maker_fill_trade_through_ticks,
+        min_price_change=min_price_change,
     ))
 
 
