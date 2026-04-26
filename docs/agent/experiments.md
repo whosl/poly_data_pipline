@@ -315,3 +315,254 @@ Best: ExtraTrees (rank_corr 0.201, best win rate at pred>=0).
 Single-model RF at threshold=0.67: 39 signals in 10 minutes, 7.7% accuracy (3/39 profitable), total profit -1.23.
 
 Two-stage RF+RF at threshold=0.005, min_p_fill=0.7, min_pred_unwind_profit=0.0: 0 signals after 2000 predictions. Live p_fill max 0.638, pred_unwind_profit max -0.009.
+
+## training_eventdriven_20260423_5m: Live 4-Run Results (2026-04-24)
+
+Model: XGBoost fill classifier + ExtraTrees unwind regressor
+Artifacts: `artifacts/training_eventdriven_20260423_5m/`
+Policy: `threshold=0.027, min_p_fill=0.75, min_pred_unwind_profit=0.0`
+Market scope: `btc-updown-5m` only
+
+### Per-Run Breakdown
+
+| Run | Time Window (UTC) | Signals | Win | Unwind | Accuracy | Profit |
+|-----|-------------------|---------|-----|--------|----------|--------|
+| 1 | 01:05~01:34 | 7 | 7 | 0 | 100% | +0.1760 |
+| 2 | 02:11~02:34 | 6 | 4 | 2 | 66.7% | +0.2046 |
+| 3 | 02:57~03:21 | 11 | 10 | 1 | 90.9% | -0.0272 |
+| 4 | 03:42~06:13 | 32 | 29 | 3 | 90.6% | +0.5993 |
+| **Combined** | | **56** | **50** | **6** | **89.3%** | **+0.9527** |
+
+### Price Bucket Analysis
+
+| Bucket | N | Win | Unwind | Acc | Profit | AvgP | MaxLoss |
+|--------|---|-----|--------|-----|--------|------|---------|
+| 0.10-0.25 | 19 | 19 | 0 | 100% | +0.5141 | +0.0271 | +0.0082 |
+| 0.25-0.35 | 15 | 12 | 3 | 80.0% | +0.3752 | +0.0250 | -0.1075 |
+| 0.35-0.45 | 7 | 7 | 0 | 100% | +0.1599 | +0.0228 | +0.0048 |
+| 0.45-0.55 | 10 | 9 | 1 | 90.0% | +0.0773 | +0.0077 | -0.0727 |
+| 0.55-0.70 | 2 | 1 | 1 | 50.0% | -0.2465 | -0.1232 | -0.2465 |
+| 0.70-0.90 | 3 | 2 | 1 | 66.7% | +0.0726 | +0.0242 | -0.0047 |
+
+Key observations:
+
+- Profit is concentrated in the 0.10-0.35 entry ask range (34 of 56 signals, +0.8893 profit)
+- 0.45-0.55 is marginal: high accuracy (90%) but low avg profit (+0.0077) due to unfavorable risk-reward
+- 0.55+ is negative on this sample: 5 signals, -0.1739 combined, with one large unwind loss at -0.2465
+- The mechanism: higher entry ask → lower `success_profit_estimate` (because `second_leg_quote = 0.96 - best_ask`) → same unwind loss magnitude → worse risk-reward ratio
+
+### Unwind Detail
+
+| Signal | Entry Ask | Mid | p_fill | Score | Profit | Unwind Price | Price Move |
+|--------|-----------|-----|--------|-------|--------|--------------|------------|
+| S000006 | 0.32 | 0.320 | 0.795 | 0.030 | +0.0248 | 0.35 | +0.04 |
+| S000017 | 0.33 | 0.325 | 0.810 | 0.028 | -0.1075 | 0.23 | -0.10 |
+| S000024 | 0.54 | 0.545 | 0.784 | 0.027 | -0.0727 | 0.47 | -0.08 |
+| S000034 | 0.26 | 0.260 | 0.867 | 0.049 | -0.0086 | 0.25 | -0.01 |
+| S000037 | 0.63 | 0.630 | 0.757 | 0.030 | -0.2465 | 0.39 | -0.25 |
+| S000051 | 0.75 | 0.750 | 0.826 | 0.031 | -0.0047 | 0.75 | -0.01 |
+
+Signal S000037 is the worst unwind: entered at ask 0.63, mid moved from 0.63 to 0.39 (24-cent adverse move), resulting in -0.2465 loss. This confirms high-entry-ask tail risk.
+
+### Operational Implications
+
+- The two-stage XGBoost+ExtraTrees model with `min_p_fill=0.75` produces signals with 89% accuracy and positive expected value
+- Entry ask price is a strong predictor of per-signal profitability
+- Consider lowering `max_entry_ask` to 0.55 to cut the negative tail
+- 56 signals is still a small sample; continue accumulating before making aggressive changes
+
+## training_8models_20260425: Full 8-Model Retrain (2026-04-25)
+
+Trained all 8 model types (RF, ExtraTrees, LightGBM, XGBoost) on full 5-day pure 5m BTC dataset.
+
+Dataset:
+- source: `artifacts/training_eventdriven_parallel_btc5m_20260420_24/alpha_dataset_parts/`
+- dates: 20260420-20260424, pure 5m BTC
+- sampled: train=1,500,000, val=200,000, test=200,000
+- features: 120
+
+Training script: `scripts/train_all_models_partitioned.py`
+
+Artifacts: `artifacts/training_8models_20260425/`
+
+### Individual Model Performance
+
+Fill classifiers (AUC):
+
+| Model | Accuracy | AUC |
+| --- | ---: | ---: |
+| lightgbm_classifier | 0.630 | 0.698 |
+| xgboost_classifier | 0.721 | 0.701 |
+
+Unwind regressors:
+
+| Model | MAE | R2 | Rank Corr |
+| --- | ---: | ---: | ---: |
+| lightgbm_regressor | 0.064 | 0.047 | 0.203 |
+| xgboost_regressor | 0.064 | 0.051 | 0.204 |
+
+### Full 16-Combination Policy Selection
+
+All fill×unwind pairs, sorted by val avg_profit:
+
+| # | Fill + Unwind | exp>= | p_fill>= | unwind>= | val_avgP | val_n | val_win | test_avgP | test_n | test_win |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | LGB_clf + RF_reg | 0.05 | 0.8 | -0.05 | 0.177 | 14 | 100% | — | 0 | — |
+| 2 | XGB_clf + RF_reg | 0.05 | 0.6 | -0.05 | 0.143 | 44 | 93.2% | 0.105 | 42 | 90.5% |
+| 3 | RF_clf + LGB_reg | 0.05 | 0.8 | -0.05 | 0.122 | 37 | 91.9% | 0.077 | 12 | 91.7% |
+| 4 | XGB_clf + LGB_reg | 0.05 | 0.75 | -0.05 | 0.118 | 24 | 100% | 0.136 | 12 | 75.0% |
+| 5 | ET_clf + RF_reg | 0.04 | 0.8 | -0.05 | 0.113 | 59 | 91.5% | 0.092 | 38 | 100% |
+| 6 | ET_clf + XGB_reg | 0.05 | 0.5 | -0.05 | 0.109 | 21 | 100% | 0.156 | 30 | 83.3% |
+| 7 | XGB_clf + ET_reg | 0.04 | 0.8 | -0.05 | 0.104 | 57 | 93.0% | 0.143 | 51 | 100% |
+| 8 | XGB_clf + XGB_reg | 0.05 | 0.7 | -0.05 | 0.103 | 12 | 100% | 0.352 | 9 | 100% |
+| 9 | ET_clf + ET_reg | 0.04 | 0.8 | -0.05 | 0.101 | 63 | 96.8% | 0.103 | 45 | 100% |
+| 10 | ET_clf + LGB_reg | 0.05 | 0.75 | -0.05 | 0.100 | 68 | 95.6% | 0.102 | 32 | 87.5% |
+| 11 | RF_clf + RF_reg | 0.05 | 0.8 | -0.05 | 0.095 | 13 | 100% | — | 0 | — |
+| 12 | RF_clf + XGB_reg | 0.05 | 0.5 | -0.05 | 0.086 | 10 | 100% | 0.213 | 12 | 83.3% |
+| 13 | LGB_clf + ET_reg | 0.04 | 0.8 | -0.05 | 0.078 | 158 | 86.1% | 0.113 | 117 | 94.9% |
+| 14 | RF_clf + ET_reg | 0.04 | 0.8 | -0.05 | 0.078 | 158 | 86.1% | 0.115 | 116 | 95.7% |
+| 15 | LGB_clf + XGB_reg | 0.04 | 0.8 | -0.05 | 0.069 | 604 | 86.8% | 0.073 | 491 | 85.3% |
+| 16 | LGB_clf + LGB_reg | 0.05 | 0.8 | -0.05 | 0.068 | 31 | 83.9% | 0.190 | 12 | 91.7% |
+
+Note: min_unwind=0.00 vs -0.05 was tested; results are identical because all selected entries already have pred_unwind >= 0.
+
+### Live Deployment: Combo #2 (XGB_clf + RF_reg)
+
+Deployed with threshold=0.05, min_p_fill=0.6, min_unwind=-0.05.
+
+Result after 10,000 predictions: **0 signals**. Live expected_profit max 0.044, below 0.05 threshold. RF regressor is too conservative in live — it underpredicts relative to the offline validation.
+
+Promising alternatives for next deployment:
+- **#5 ET_clf + RF_reg** (threshold=0.04): val 0.113, test 0.092, 100% win rate on test
+- **#7 XGB_clf + ET_reg** (threshold=0.04): val 0.104, test 0.143, 100% win rate on test, 51 test entries
+
+## training_eventdriven_all5m_80m: Full 80M Row Retrain (2026-04-25)
+
+Retrained on all available 5m BTC Up/Down data using GPT-processed 80M row partitioned Hive dataset.
+
+Dataset:
+- source: `data/normalized/` partitioned Hive-style (`date=YYYYMMDD/market_id=xxx.parquet`)
+- 80M total rows across 656 parquet files, 183 columns, 12GB on disk
+- dates: `20260420` through `20260424`
+- split: train=20260420-20260422 (500K sampled per date = 1.5M), val=20260423 (200K), test=20260424 (200K)
+- sampling: file-by-file PyArrow fragment loading with step-based downsampling (avoids OOM)
+- feature columns: 120
+
+Training script: `scripts/train_fast.py` (LightGBM + XGBoost only, no sklearn RF/ET)
+
+Models trained (8 total):
+- fill classifiers: `lightgbm_classifier`, `xgboost_classifier`
+- unwind regressors: `lightgbm_regressor`, `xgboost_regressor`
+- fill regressors: `lightgbm_regressor`, `xgboost_regressor` (auxiliary)
+- unwind classifiers: `lightgbm_classifier`, `xgboost_classifier` (auxiliary)
+
+Artifacts: `artifacts/training_eventdriven_all5m_80m/`
+
+### Policy Selection Results (all 4 fill×unwind combinations)
+
+| Fill Model | Unwind Model | Val AvgP | Val n | Val Win | Test AvgP | Test n | Test Win | Config |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| LGB_clf | LGB_reg | 0.1721 | 23 | 78.3% | 0.1561 | 17 | 94.1% | exp>=0.05, p_fill>=0.8, unwind>=-0.05 |
+| XGB_clf | LGB_reg | 0.0963 | 17 | 94.1% | 0.1167 | 12 | 75.0% | exp>=0.05, p_fill>=0.75, unwind>=-0.05 |
+| XGB_clf | XGB_reg | 0.0812 | 21 | 76.2% | 0.2075 | 36 | 80.6% | exp>=0.05, p_fill>=0.5, unwind>=-0.05 |
+| **LGB_clf** | **XGB_reg** | **0.0716** | **802** | **81.9%** | **0.0857** | **530** | **87.5%** | **exp>=0.04, p_fill>=0.8, unwind>=-0.05** |
+
+### Selected Combination: LGB_clf + XGB_reg
+
+Selected for live deployment despite not having the highest avg_profit, because it has 35-40x more samples than the next-best combos (802 val / 530 test vs 17-23 val / 12-36 test), making it statistically far more reliable.
+
+Thresholds:
+- `expected_profit_threshold = 0.04` (up from 0.025/0.027)
+- `min_p_fill = 0.8` (up from 0.5/0.75)
+- `min_pred_unwind_profit = -0.05` (unchanged)
+
+Test performance: 530 entries, 87.5% win rate, avg_profit=0.0857, total_profit=45.42
+
+Compared to previous live model (XGB_clf + ET_reg, training_eventdriven_20260423_5m):
+- Higher thresholds → fewer but higher-quality signals
+- Much larger training dataset (1.5M sampled from 80M vs 1.6M from single parquet)
+- More dates in training (5 days vs 2 days)
+- LightGBM fill classifier instead of XGBoost
+
+## training_chrono_purge_20260426: Chronological Split with 300s Purge
+
+First proper chronological train/val/test split with 300s purge/embargo gap.
+
+Dataset:
+- source: `artifacts/training_eventdriven_parallel_btc5m_20260420_24/alpha_dataset_parts/`
+- Train: 20260420-20260422 (57M rows, incremental 100 rounds/date × 3 = 300 total)
+- Val: 20260423 (15.4M rows, 300s embargo + purge)
+- Test: 20260424 (7.6M rows, 300s embargo)
+- Features: 125 (before removal), 106 (after zero-importance removal)
+- Purge/embargo: 300s between each split boundary
+
+Training script: `scripts/train_full_chrono.py`
+
+### 19 Zero-Importance Features Removed
+
+Cross-model zero-importance features identified by checking gain=0 across all 4 models (LGB_clf, XGB_clf, LGB_reg, XGB_reg). Removed from both offline features and live pipeline:
+
+Removed: `depth_top1_imbalance`, `imbalance_bucket`, `spread_bucket`, `price_bucket`, `min_order_size`, `maker_base_fee`, `taker_base_fee`, `top3/5/10_imbalance`, `cum_bid/ask_depth_topN_proxy`, `depth_level_imbalance_proxy`, `bid/ask_depth_slope`, `binance_spread`, `poly_trade_count_recent`, `poly_aggressive_buy/sell_volume_recent`, `poly_signed_volume_recent`
+
+Result: 125 → 106 features.
+
+### Policy Selection Results (4 combinations)
+
+| Fill | Unwind | Val AvgP | Val n | Val Win | Test AvgP | Test n | Test Win | Config |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| XGB_clf | XGB_reg | 0.0962 | 7,037 | 85.9% | 0.0957 | 1,092 | 92.0% | exp>=0.05, p_fill>=0.8, unwind>=-0.05 |
+| XGB_clf | LGB_reg | 0.0780 | 3,201 | 75.3% | 0.0540 | 1,616 | 59.4% | exp>=0.05, p_fill>=0.8, unwind>=-0.05 |
+| LGB_clf | XGB_reg | 0.0697 | 10,400 | 74.7% | 0.0802 | 2,100 | 91.5% | exp>=0.05, p_fill>=0.8, unwind>=-0.05 |
+| LGB_clf | LGB_reg | 0.0471 | 97,499 | 80.4% | 0.0528 | 31,342 | 82.1% | exp>=0.04, p_fill>=0.8, unwind>=-0.05 |
+
+### Live Deployment: XGB_clf + XGB_reg
+
+Deployed with threshold=0.05, min_p_fill=0.8, min_unwind=-0.05.
+
+**Result: nearly zero signals.** After 212,000 predictions over ~4 hours:
+- Signals: 1 (lost, profit -0.0991)
+- p_fill distribution: median=0.30, p90=0.52 — XGB classifier too conservative for 0.8 gate
+- blocked_p_fill: 99.7-100% of samples per window
+
+### Live Deployment: LGB_clf + XGB_reg
+
+Switched to LGB fill classifier (p_fill distribution much better: median=0.50, p90=0.72).
+
+**Result: still 0 signals after 12,000 predictions.** expected_profit max=0.044, below 0.05 threshold. Market was calm (Saturday morning ET).
+
+Status: LGB_clf + XGB_reg still running on Ireland. Need either market volatility or lower threshold (0.03-0.04) to produce signals.
+
+## RF/ET Training Attempt (2026-04-26)
+
+Attempted to train sklearn RandomForest and ExtraTrees models on the same chronological split.
+
+**Goal:** Test if RF/ET produce better p_fill distributions for live signal production.
+
+### Approach: Balanced Sampling
+
+Strategy: keep all positive labels (y=1) + equal number of randomly sampled negatives per date.
+
+Two-pass loading to avoid OOM:
+1. Pass 1: load only label columns, determine positive/negative indices
+2. Pass 2: load feature columns only for sampled recv_ns range
+
+### Problems Encountered
+
+1. **First attempt (6M target, importance-weighted):** OOM when concatenating 57M rows from 3 dates
+2. **Second attempt (per-date importance sampling):** OOM during Polars concat, killed before training
+3. **Third attempt (per-date sampling, 3M target):** sklearn RF training extremely slow — 23+ hours for 300 trees × 6M rows × 120 features. sklearn's exact split algorithm (sort-based) doesn't scale.
+4. **Fourth attempt (balanced pos+neg, 3M target):** OOM again during data loading
+5. **Fifth attempt (two-pass balanced, 3M target):** Process stuck after Phase 1 loading — Polars threads sleeping, possibly OOM during to_numpy() conversion on Mac (16GB RAM)
+
+### Key Takeaway
+
+sklearn RF/ET with exact splits does not scale to millions of rows × 100+ features. The fundamental issue:
+- sklearn uses exact split (sorts all feature values at each node) — O(n × m × log(n)) per node
+- LightGBM/XGBoost use histogram-based splits — much faster on large data
+- Mac's 16GB RAM is insufficient for the data loading + numpy conversion step
+
+### Next Steps
+
+- Run RF/ET training on machine with more RAM (user's PC: i5-13600KF, 32GB) or Ireland server
+- Consider using histogram-based RF alternatives (e.g., `cuml` RandomForest on GPU, or reduced feature set)
+- Training script ready: `scripts/train_rf_et.py` with balanced sampling and two-pass loading

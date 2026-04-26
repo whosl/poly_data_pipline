@@ -1,81 +1,80 @@
 # Current Objectives
 
-Updated: 2026-04-23
+Updated: 2026-04-26
 
 ## Live Pipeline Status
 
-Model: `training_eventdriven_20260423_5m` (XGBoost fill + ExtraTrees unwind)
+Current process: `signal_server.py` (WebSocket bridge for poly_bot on port 8765)
 Server: Ireland (108.132.27.76)
-Status: **running well**
 
-| Metric | Value |
-|--------|-------|
-| Predictions | 354,000 |
-| Signals | 148 |
-| Resolved | 148 |
-| Accuracy | 90.5% |
-| Total PnL | +2.4720 |
-| Win rate | 93.3% (126W / 9L) |
-| Uptime | 6h 43min |
-| Prediction rate | 14.6/sec |
-| CPU | 56-60% |
-| Memory | 289MB |
+**Current deployment: LGB_clf + XGB_reg** (chronological split, 300s purge)
+- Model: `artifacts/training_chrono_purge_20260426/`
+- Config: threshold=0.05, min_p_fill=0.8, min_unwind=-0.05
+- Status: **0 signals after 12,000 predictions** — expected_profit max=0.044, below 0.05 threshold
+- p_fill distribution improved (median 0.50 vs 0.30 for XGB_clf), but still no signals
 
-## Gate Flow Analysis (latest 1000-sample batch)
+**Previous deployment: XGB_clf + XGB_reg**
+- 212,000 predictions → 1 signal (lost -0.0991)
+- XGB classifier p_fill too conservative (median 0.30, 99.7% blocked by min_p_fill=0.8)
 
-```
-samples: 1960
-├── pre_model_skip: 960 (49%)
-│   ├── blocked_entry_filter: 959
-│   └── blocked_cooldown: 1
-└── model inference: 1000 (51%)
-    ├── blocked_threshold: 1000 (100%)
-    ├── blocked_p_fill: 1000 (100%)
-    ├── blocked_unwind: 986 (98.6%)
-    └── pass_unwind: 14 (1.4%)
-```
+## Immediate Problems
 
-## Current Objectives
+1. **Live signal production blocked**: Neither XGB_clf nor LGB_clf can consistently produce expected_profit >= 0.05 in live. Options:
+   - Lower threshold to 0.03-0.04
+   - Try different model combos (RF/ET may have better p_fill distributions)
+   - Wait for higher-volatility market conditions
 
-### 1. Monitor live calibration
+2. **RF/ET training failed on Mac**: sklearn RF/ET too slow for 3M+ rows × 120 features (exact split algorithm). Multiple OOM kills on 16GB Mac. Need to run on machine with more RAM (user PC: 32GB) or Ireland server.
 
-Accumulate 500+ resolved signals, then run calibration analysis:
+## Active Tasks
 
-```bash
-python scripts/analyze_live_calibration.py \
-  --samples logs/live_candidate_samples.jsonl \
-  --output-dir artifacts/live_calibration/<timestamp>
-```
+### 1. RF/ET Model Training
 
-Compare live `p_fill`, `pred_unwind_profit`, `pred_expected_profit` distributions against offline validation.
+Script ready: `scripts/train_rf_et.py`
+- Balanced sampling: positive labels + equal negatives per date
+- Two-pass loading to reduce memory
+- 100 trees × depth 12
+- Needs machine with 32GB+ RAM to complete
 
-### 2. Optimize CPU usage
+Blocked on: finding suitable hardware to run training.
 
-Current 60% CPU is driven by model inference on samples that all get blocked by post-model gates. Options:
+### 2. Live Threshold Calibration
 
-- **Increase `sample_interval`** from 100ms to 200-500ms (reduces prediction rate proportionally)
-- Post-model gates (threshold, p_fill, unwind) cannot be moved to pre-model because they depend on model output
+Consider lowering threshold from 0.05 to 0.03 or 0.04.
+- LGB_clf + LGB_reg (backtest combo #4) used threshold=0.04
+- Current LGB_clf live max expected_profit = 0.044, so 0.04 would allow some signals
 
-### 3. Collect more signal samples
+### 3. Feature Reduction
 
-Continue running to accumulate signal samples for offline analysis. Current `live_signal_samples.jsonl` has 25MB+ of data.
+19 zero-importance features removed (125 → 106). Further pruning proposed (GPT V2-V5 plan) but not yet executed. Waiting for live model to work first.
 
-### 4. Validate unwind regressor accuracy
+## Recent Experiments Summary
 
-The unwind regressor is the critical filter. When `pred_unwind_profit > 0`, actual win rate is 76.5%. When negative, only 26.9%. Verify this calibration holds as more data accumulates.
+### Chronological Split Training (training_chrono_purge_20260426)
 
-### 5. Reconcile offline vs live labels
+Best backtest: XGB_clf + XGB_reg — val avgP=0.096, test avgP=0.096, test win=92%
+But live: almost no signals due to conservative p_fill.
 
-Use `live_candidate_samples.jsonl` and `live_signal_samples.jsonl` to compare:
+| Combo | Val AvgP | Val n | Test AvgP | Test n | Test Win |
+|---|---:|---:|---:|---:|---:|
+| XGB_clf + XGB_reg | 0.0962 | 7,037 | 0.0957 | 1,092 | 92.0% |
+| XGB_clf + LGB_reg | 0.0780 | 3,201 | 0.0540 | 1,616 | 59.4% |
+| LGB_clf + XGB_reg | 0.0697 | 10,400 | 0.0802 | 2,100 | 91.5% |
+| LGB_clf + LGB_reg | 0.0471 | 97,499 | 0.0528 | 31,342 | 82.1% |
 
-- maker-fill false positives
-- fill-lag mismatch
-- score distribution drift
-- unwind tail misses
+### Live Deployment History
+
+| Date | Model | Threshold | Signals | Notes |
+|------|-------|-----------|---------|-------|
+| 04-25 | XGB_clf + RF_reg | 0.05 | 0 | RF_reg too conservative |
+| 04-26 | XGB_clf + XGB_reg | 0.05 | 1 (lost) | p_fill too low (median 0.30) |
+| 04-26 | LGB_clf + XGB_reg | 0.05 | 0 (running) | p_fill better but exp_profit < 0.05 |
 
 ## Reference
 
-- Pipeline config: `--threshold 0.027 --min-p-fill 0.75 --min-pred-unwind-profit 0.0 --sample-interval 100`
-- SSH: `ssh -4 -i ~/Downloads/EuKey.pem -o ConnectTimeout=15 -o ProxyCommand=none ubuntu@108.132.27.76`
-- Logs: `/tmp/live_predict.log` (current), `~/poly_trade_pipeline/logs/live_predict.log` (historical)
-- Signal samples: `~/poly_trade_pipeline/logs/live_signal_samples.jsonl`
+- SSH: `ssh ireland`
+- Logs: `~/poly_trade_pipeline/logs/signal_server.log`
+- WebSocket: `ws://108.132.27.76:8765`
+- Chrono training artifacts: `artifacts/training_chrono_purge_20260426/`
+- RF/ET training script: `scripts/train_rf_et.py`
+- Chrono training script: `scripts/train_full_chrono.py`

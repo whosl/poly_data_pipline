@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import re
 from pathlib import Path
@@ -27,7 +28,6 @@ NS_PER_MS = 1_000_000
 NS_PER_SECOND = 1_000_000_000
 EXPIRY_RE = re.compile(r"(?P<symbol>btc|eth)-updown-(?P<period>5m|15m)-(?P<expiry>\d+)", re.I)
 DEPTH_FEATURE_COLUMNS = [
-    "depth_top1_imbalance",
     "depth_top3_imbalance",
     "depth_top5_imbalance",
     "depth_top10_imbalance",
@@ -63,12 +63,12 @@ class BuildResult:
 
 
 def build_training_dataset(config: DatasetConfig) -> BuildResult:
-    tables_by_date = {date: load_date_tables(config.data_dir, date) for date in config.dates}
-    table_report = schema_report(tables_by_date)
-
     date_frames: list[pl.DataFrame] = []
+    table_report: list[dict[str, object]] = []
     quality: list[dict[str, object]] = []
-    for date, tables in tables_by_date.items():
+    for date in config.dates:
+        tables = load_date_tables(config.data_dir, date)
+        table_report.extend(schema_report({date: tables}))
         try:
             frame = build_date_dataset(date, tables, config)
         except Exception as exc:
@@ -98,23 +98,236 @@ def build_date_dataset(
         return pl.DataFrame()
 
     book = canonicalize_book(poly_book)
+    book = filter_book_scope(book, config)
     if book.is_empty():
         logger.warning("empty_canonical_book", date=date)
         return pl.DataFrame()
 
-    samples = sample_book(book, config.sample_interval_ms)
-    samples = add_lob_features(samples)
-    samples = add_book_event_features(samples, book)
     poly_trades = canonicalize_trades(enrich_with_metadata(get_frame(tables, "poly_trades"), metadata))
+    binance_book = canonicalize_binance_book(tables)
+    binance_trades = canonicalize_trades(get_frame(tables, "binance_trades"))
+    research = get_frame(tables, "poly_enriched_book")
+
+    if config.feature_workers > 1:
+        return build_date_dataset_by_market(
+            date=date,
+            book=book,
+            poly_trades=poly_trades,
+            binance_book=binance_book,
+            binance_trades=binance_trades,
+            research=research,
+            config=config,
+        )
+
+    return build_feature_frame(book, poly_trades, binance_book, binance_trades, research, config)
+
+
+def write_training_dataset_parts(
+    config: DatasetConfig,
+    output_dir: Path,
+    basename: str = "alpha_dataset",
+) -> dict[str, object]:
+    """Build and write one dataset part per date/market_id.
+
+    This keeps event-driven training feasible for large days by never holding a
+    full date or multi-date feature dataset in memory.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    parts_dir = output_dir / f"{basename}_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    table_report: list[dict[str, object]] = []
+    quality: list[dict[str, object]] = []
+    total_rows = 0
+    first_frame: pl.DataFrame | None = None
+
+    for date in config.dates:
+        tables = load_date_tables(config.data_dir, date)
+        table_report.extend(schema_report({date: tables}))
+        try:
+            date_rows, example = write_date_dataset_parts(date, tables, config, parts_dir)
+        except Exception as exc:
+            logger.warning("date_dataset_parts_failed", date=date, error=str(exc))
+            quality.append({"date": date, "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        total_rows += date_rows
+        if first_frame is None and example is not None and not example.is_empty():
+            first_frame = example
+        quality.append({"date": date, "status": "ok" if date_rows else "empty", "rows": date_rows})
+
+    metadata_frame = first_frame if first_frame is not None else pl.DataFrame()
+    metadata = make_metadata(metadata_frame, config, table_report, quality)
+    metadata["rows"] = total_rows
+    metadata["partitioned"] = True
+    metadata["parts_dir"] = str(parts_dir)
+    metadata_path = output_dir / f"{basename}_metadata.json"
+    save_json(metadata, metadata_path)
+    return {"parts_dir": str(parts_dir), "metadata": str(metadata_path), "rows": total_rows}
+
+
+def write_date_dataset_parts(
+    date: str,
+    tables: dict[str, TableLoadResult],
+    config: DatasetConfig,
+    parts_dir: Path,
+) -> tuple[int, pl.DataFrame | None]:
+    metadata = canonicalize_metadata(get_frame(tables, "poly_market_metadata"))
+    poly_book = enrich_with_metadata(choose_poly_book(tables), metadata)
+    if poly_book is None or poly_book.is_empty():
+        logger.warning("missing_poly_book", date=date)
+        return 0, None
+
+    book = filter_book_scope(canonicalize_book(poly_book), config)
+    if book.is_empty():
+        logger.warning("empty_canonical_book", date=date)
+        return 0, None
+
+    poly_trades = canonicalize_trades(enrich_with_metadata(get_frame(tables, "poly_trades"), metadata))
+    binance_book = canonicalize_binance_book(tables)
+    binance_trades = canonicalize_trades(get_frame(tables, "binance_trades"))
+    research = get_frame(tables, "poly_enriched_book")
+
+    market_ids = [
+        str(market_id)
+        for market_id in book.select("market_id").unique().to_series().to_list()
+        if market_id is not None and str(market_id) != ""
+    ]
+    if not market_ids:
+        market_ids = ["__all__"]
+
+    workers = max(1, int(config.feature_workers))
+    logger.info("date_market_part_start", date=date, markets=len(market_ids), workers=workers)
+    date_dir = parts_dir / f"date={date}"
+    date_dir.mkdir(parents=True, exist_ok=True)
+    total_rows = 0
+    example: pl.DataFrame | None = None
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                build_market_feature_frame,
+                market_id,
+                book,
+                poly_trades,
+                binance_book,
+                binance_trades,
+                research,
+                config,
+            ): market_id
+            for market_id in market_ids
+        }
+        for future in as_completed(futures):
+            market_id = futures[future]
+            try:
+                frame = future.result()
+            except Exception as exc:
+                logger.warning("market_feature_failed", date=date, market_id=market_id, error=str(exc))
+                continue
+            if frame.is_empty():
+                continue
+            frame = frame.with_columns(pl.lit(date).alias("date"))
+            part_path = date_dir / f"market_id={safe_part_name(market_id)}.parquet"
+            frame.write_parquet(str(part_path))
+            total_rows += frame.height
+            if example is None:
+                example = frame.head(1000)
+            logger.info("market_part_written", date=date, market_id=market_id, rows=frame.height, path=str(part_path))
+
+    logger.info("date_market_part_done", date=date, markets=len(market_ids), rows=total_rows)
+    return total_rows, example
+
+
+def build_date_dataset_by_market(
+    date: str,
+    book: pl.DataFrame,
+    poly_trades: pl.DataFrame,
+    binance_book: pl.DataFrame,
+    binance_trades: pl.DataFrame,
+    research: pl.DataFrame | None,
+    config: DatasetConfig,
+) -> pl.DataFrame:
+    market_ids = [
+        market_id
+        for market_id in book.select("market_id").unique().to_series().to_list()
+        if market_id is not None and str(market_id) != ""
+    ]
+    if not market_ids:
+        return build_feature_frame(book, poly_trades, binance_book, binance_trades, research, config)
+
+    workers = max(1, int(config.feature_workers))
+    logger.info("date_market_parallel_start", date=date, markets=len(market_ids), workers=workers)
+    frames: list[pl.DataFrame] = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                build_market_feature_frame,
+                str(market_id),
+                book,
+                poly_trades,
+                binance_book,
+                binance_trades,
+                research,
+                config,
+            ): str(market_id)
+            for market_id in market_ids
+        }
+        for future in as_completed(futures):
+            market_id = futures[future]
+            try:
+                frame = future.result()
+            except Exception as exc:
+                logger.warning("market_feature_failed", date=date, market_id=market_id, error=str(exc))
+                continue
+            if not frame.is_empty():
+                frames.append(frame)
+    result = concat_non_empty(frames).sort(["market_id", "asset_id", "recv_ns"])
+    logger.info("date_market_parallel_done", date=date, markets=len(market_ids), rows=result.height)
+    return result
+
+
+def build_market_feature_frame(
+    market_id: str,
+    book: pl.DataFrame,
+    poly_trades: pl.DataFrame,
+    binance_book: pl.DataFrame,
+    binance_trades: pl.DataFrame,
+    research: pl.DataFrame | None,
+    config: DatasetConfig,
+) -> pl.DataFrame:
+    if market_id == "__all__":
+        return build_feature_frame(book, poly_trades, binance_book, binance_trades, research, config)
+    market_filter = pl.col("market_id") == market_id
+    market_book = book.filter(market_filter)
+    market_trades = poly_trades.filter(market_filter) if not poly_trades.is_empty() and "market_id" in poly_trades.columns else pl.DataFrame()
+    market_research = (
+        research.filter(market_filter)
+        if research is not None and not research.is_empty() and "market_id" in research.columns
+        else research
+    )
+    return build_feature_frame(market_book, market_trades, binance_book, binance_trades, market_research, config)
+
+
+def build_feature_frame(
+    book: pl.DataFrame,
+    poly_trades: pl.DataFrame,
+    binance_book: pl.DataFrame,
+    binance_trades: pl.DataFrame,
+    research: pl.DataFrame | None,
+    config: DatasetConfig,
+) -> pl.DataFrame:
+    samples = book if config.sample_mode == "event-driven" else sample_book(book, config.sample_interval_ms)
+    samples = add_lob_features(samples)
+    event_source = samples if config.book_event_source == "samples" else book
+    samples = add_book_event_features(samples, event_source)
     samples = add_trade_features(samples, poly_trades)
     samples = add_binance_features(
         samples,
-        canonicalize_binance_book(tables),
-        canonicalize_trades(get_frame(tables, "binance_trades")),
+        binance_book,
+        binance_trades,
         config.join_tolerance_ms,
     )
     samples = add_ewma_features(samples)
-    samples = add_research_buckets(samples, get_frame(tables, "poly_enriched_book"), config.join_tolerance_ms)
+    samples = add_research_buckets(samples, research, config.join_tolerance_ms)
     samples = add_future_book_labels(samples, book, [1, 3, 5, 10], config.join_tolerance_ms)
     samples = add_alpha_labels(
         samples,
@@ -152,6 +365,19 @@ def build_date_dataset(
         max_total_price=config.two_leg_max_total_price,
     )
     return filter_training_rows(samples, config)
+
+
+def filter_book_scope(book: pl.DataFrame, config: DatasetConfig) -> pl.DataFrame:
+    if book.is_empty():
+        return book
+    filters: list[pl.Expr] = []
+    if config.symbols and "symbol" in book.columns:
+        filters.append(pl.col("symbol").str.to_uppercase().is_in([s.upper() for s in config.symbols]))
+    if config.periods and "period" in book.columns:
+        filters.append(pl.col("period").str.to_lowercase().is_in([p.lower() for p in config.periods]))
+    if not filters:
+        return book
+    return book.filter(pl.all_horizontal(filters))
 
 
 def choose_poly_book(tables: dict[str, TableLoadResult]) -> pl.DataFrame | None:
@@ -331,15 +557,9 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
         "total_bid_levels",
         "total_ask_levels",
         *DEPTH_FEATURE_COLUMNS,
-        "imbalance_bucket",
-        "spread_bucket",
-        "price_bucket",
         "vol_bucket",
         "vol_60s",
         "tick_size",
-        "min_order_size",
-        "maker_base_fee",
-        "taker_base_fee",
         "volume_24h",
         "liquidity",
     ]
@@ -375,21 +595,6 @@ def add_lob_features(samples: pl.DataFrame) -> pl.DataFrame:
             df = df.with_columns(pl.lit(None).alias(col))
     df = df.with_columns(
         [
-            # Use real top-N imbalance from depth features when available;
-            # fall back to top1 proxy for old data that lacks depth columns.
-            pl.coalesce([pl.col("depth_top3_imbalance"), pl.col("top1_imbalance")]).alias("top3_imbalance"),
-            pl.coalesce([pl.col("depth_top5_imbalance"), pl.col("top1_imbalance")]).alias("top5_imbalance"),
-            pl.coalesce([pl.col("depth_top10_imbalance"), pl.col("top1_imbalance")]).alias("top10_imbalance"),
-            # Use real cumulative depth when available; fall back to level-count proxy.
-            pl.coalesce([pl.col("cum_bid_depth_top10"), pl.col("total_bid_levels").cast(pl.Float64)]).alias("cum_bid_depth_topN_proxy"),
-            pl.coalesce([pl.col("cum_ask_depth_top10"), pl.col("total_ask_levels").cast(pl.Float64)]).alias("cum_ask_depth_topN_proxy"),
-            pl.coalesce(
-                [pl.col("depth_top10_imbalance"),
-                 (pl.col("total_bid_levels").cast(pl.Float64) - pl.col("total_ask_levels").cast(pl.Float64))]
-            ).alias("depth_level_imbalance_proxy"),
-            # Use real depth slope when available; fall back to None.
-            pl.coalesce([pl.col("bid_depth_slope_top10"), pl.lit(None, dtype=pl.Float64)]).alias("bid_depth_slope"),
-            pl.coalesce([pl.col("ask_depth_slope_top10"), pl.lit(None, dtype=pl.Float64)]).alias("ask_depth_slope"),
             pl.lit(None, dtype=pl.Float64).alias("queue_depletion_proxy"),
         ]
     )
@@ -551,13 +756,9 @@ def add_trade_features(samples: pl.DataFrame, trades: pl.DataFrame) -> pl.DataFr
             "poly_trade_count_100ms",
             "poly_trade_count_500ms",
             "poly_trade_count_1s",
-            "poly_trade_count_recent",
             "poly_aggressive_buy_volume_1s",
             "poly_aggressive_sell_volume_1s",
             "poly_signed_volume_1s",
-            "poly_aggressive_buy_volume_recent",
-            "poly_aggressive_sell_volume_recent",
-            "poly_signed_volume_recent",
             "poly_signed_volume_imbalance_recent",
             "poly_recent_vwap",
             "poly_sweep_indicator_proxy",
@@ -576,13 +777,9 @@ def empty_trade_feature_exprs() -> list[pl.Expr]:
         pl.lit(0.0).alias("poly_trade_count_100ms"),
         pl.lit(0.0).alias("poly_trade_count_500ms"),
         pl.lit(0.0).alias("poly_trade_count_1s"),
-        pl.lit(0.0).alias("poly_trade_count_recent"),
         pl.lit(0.0).alias("poly_aggressive_buy_volume_1s"),
         pl.lit(0.0).alias("poly_aggressive_sell_volume_1s"),
         pl.lit(0.0).alias("poly_signed_volume_1s"),
-        pl.lit(0.0).alias("poly_aggressive_buy_volume_recent"),
-        pl.lit(0.0).alias("poly_aggressive_sell_volume_recent"),
-        pl.lit(0.0).alias("poly_signed_volume_recent"),
         pl.lit(0.0).alias("poly_signed_volume_imbalance_recent"),
         pl.lit(None, dtype=pl.Float64).alias("poly_recent_vwap"),
         pl.lit(None, dtype=pl.Float64).alias("poly_recent_vwap_deviation"),
@@ -618,7 +815,6 @@ def canonicalize_binance_book(tables: dict[str, TableLoadResult]) -> pl.DataFram
             "asset_id": "binance_asset_id",
             "symbol": "binance_symbol",
             "current_mid": "binance_mid",
-            "current_spread": "binance_spread",
             "top1_imbalance": "binance_book_imbalance",
         }
     ).sort("recv_ns")
@@ -659,6 +855,10 @@ def canonicalize_binance_book(tables: dict[str, TableLoadResult]) -> pl.DataFram
     return joined.sort("recv_ns")
 
 
+# Timestamp offsets for Binance historical mid lookups (in milliseconds).
+_BINANCE_RETURN_OFFSETS_MS = [100, 250, 500, 1_000, 3_000, 5_000]
+
+
 def add_binance_features(
     samples: pl.DataFrame,
     binance_book: pl.DataFrame,
@@ -670,15 +870,9 @@ def add_binance_features(
         df = df.with_columns(empty_binance_feature_exprs())
     else:
         join_globally = binance_book["binance_symbol"].drop_nulls().n_unique() <= 1
-        b = binance_book.sort("recv_ns").with_columns(
-            [
-                pl.col("binance_mid").pct_change().alias("binance_return_tick"),
-                pl.col("binance_mid").pct_change(n=1).alias("binance_return_100ms"),
-                pl.col("binance_mid").pct_change(n=5).alias("binance_return_500ms"),
-                pl.col("binance_mid").pct_change(n=10).alias("binance_return_1s"),
-                pl.col("binance_mid").pct_change(n=30).alias("binance_return_3s"),
-            ]
-        )
+
+        # Asof join current Binance state (mid, spread, depth features).
+        b = binance_book.sort("recv_ns")
         if join_globally:
             df = df.sort("recv_ns").join_asof(
                 b.drop(["binance_symbol"], strict=False),
@@ -693,6 +887,11 @@ def add_binance_features(
                 by=["symbol"],
                 tolerance_ms=tolerance_ms,
             )
+
+        # Timestamp-based Binance returns via shifted asof joins.
+        b_mid = b.select(["recv_ns", "binance_mid"]).sort("recv_ns")
+        df = _add_timestamp_based_binance_returns(df, b_mid, tolerance_ms)
+
         for expr in empty_binance_feature_exprs():
             name = expr.meta.output_name()
             if name not in df.columns:
@@ -726,15 +925,110 @@ def add_binance_features(
     elif "binance_recent_trade_imbalance" not in df.columns:
         df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("binance_recent_trade_imbalance"))
 
-    df = df.with_columns(
-        [
-            pl.col("current_mid").pct_change(n=10).over(["market_id", "asset_id"]).alias("poly_return_1s"),
-            (pl.col("binance_return_1s") - pl.col("current_mid").pct_change(n=10).over(["market_id", "asset_id"]))
-            .alias("lead_lag_binance_minus_poly_1s"),
-            (pl.col("binance_return_500ms") - pl.col("current_mid").pct_change(n=5).over(["market_id", "asset_id"]))
-            .alias("lead_lag_binance_minus_poly_500ms"),
-        ]
-    )
+    # Timestamp-based poly returns and lead-lag.
+    df = _add_poly_returns_and_lead_lag(df)
+    return df
+
+
+def _add_timestamp_based_binance_returns(
+    df: pl.DataFrame, b_mid: pl.DataFrame, tolerance_ms: int,
+) -> pl.DataFrame:
+    """Compute true time-window Binance returns via shifted asof joins.
+
+    For each offset, shift Binance timestamps forward so that a backward asof
+    join finds the latest Binance mid at exactly ``t - offset``.
+    """
+    # Data freshness: how old is the current Binance snapshot.
+    if "binance_mid" in df.columns and "recv_ns" in df.columns:
+        # We need the Binance recv_ns too; do a quick asof to get it.
+        b_ts = b_mid.rename({"binance_mid": "_binance_mid_for_ts"}).with_columns(
+            pl.col("recv_ns").alias("_binance_recv_ns")
+        ).sort("recv_ns")
+        df = df.sort("recv_ns").join_asof(
+            b_ts, on="recv_ns", strategy="backward",
+            tolerance=tolerance_ms * NS_PER_MS,
+        )
+        df = df.with_columns(
+            ((pl.col("recv_ns") - pl.col("_binance_recv_ns")).cast(pl.Int64) / NS_PER_MS)
+            .alias("binance_age_ms")
+        ).drop("_binance_recv_ns", "_binance_mid_for_ts")
+
+    for offset_ms in _BINANCE_RETURN_OFFSETS_MS:
+        offset_ns = offset_ms * NS_PER_MS
+        suffix = f"{offset_ms}ms"
+        # Shift Binance timestamps forward by offset so backward join finds t - offset.
+        b_hist = b_mid.select(
+            (pl.col("recv_ns") + offset_ns).alias("recv_ns"),
+            pl.col("binance_mid").alias(f"_binance_mid_{suffix}"),
+        ).sort("recv_ns")
+
+        # Tolerance: half the offset, capped at 500ms.
+        tol = min(offset_ns // 2, 500 * NS_PER_MS)
+        df = df.sort("recv_ns").join_asof(
+            b_hist, on="recv_ns", strategy="backward", tolerance=tol,
+        )
+        # Compute return.
+        hist_col = f"_binance_mid_{suffix}"
+        label = f"binance_return_{suffix}"
+        df = df.with_columns(
+            (pl.col("binance_mid") / pl.col(hist_col) - 1).alias(label)
+        ).drop(hist_col)
+
+    return df
+
+
+def _add_poly_returns_and_lead_lag(df: pl.DataFrame) -> pl.DataFrame:
+    """Timestamp-based Polymarket returns and Binance-Poly lead-lag.
+
+    Uses an asof self-join on shifted recv_ns to find the true mid at t-offset.
+    """
+    df = df.sort(["market_id", "asset_id", "recv_ns"])
+
+    # Build a reference table of (market_id, asset_id, recv_ns, current_mid).
+    poly_mids = df.select([
+        "market_id", "asset_id", "recv_ns", "current_mid",
+    ]).sort(["market_id", "asset_id", "recv_ns"])
+
+    # Polymarket returns at fixed time offsets.
+    poly_offsets = [(500, "500ms"), (1_000, "1s"), (3_000, "3s")]
+    for offset_ms, suffix in poly_offsets:
+        offset_ns = offset_ms * NS_PER_MS
+        shifted = poly_mids.with_columns(
+            (pl.col("recv_ns") + offset_ns).alias("_shifted_ts")
+        ).select([
+            "market_id", "asset_id",
+            pl.col("_shifted_ts").alias("recv_ns"),
+            pl.col("current_mid").alias(f"_poly_mid_{suffix}"),
+        ]).sort(["market_id", "asset_id", "recv_ns"])
+
+        col_name = f"poly_return_{suffix}" if suffix != "500ms" else "poly_return_500ms"
+        if offset_ms == 1_000:
+            col_name = "poly_return_1s"
+
+        df = df.sort(["market_id", "asset_id", "recv_ns"]).join_asof(
+            shifted,
+            on="recv_ns",
+            by=["market_id", "asset_id"],
+            strategy="backward",
+            tolerance=offset_ns,
+        )
+        hist_col = f"_poly_mid_{suffix}"
+        df = df.with_columns(
+            (pl.col("current_mid") / pl.col(hist_col) - 1).alias(col_name)
+        ).drop(hist_col)
+
+    # Lead-lag features (Binance return minus Poly return, same time window).
+    lead_lag_defs = [
+        ("binance_return_500ms", "poly_return_500ms", "lead_lag_binance_minus_poly_500ms"),
+        ("binance_return_1000ms", "poly_return_1s", "lead_lag_binance_minus_poly_1s"),
+        ("binance_return_3000ms", "poly_return_3s", "lead_lag_3s"),
+    ]
+    for bin_col, poly_col, out_col in lead_lag_defs:
+        if bin_col in df.columns and poly_col in df.columns:
+            df = df.with_columns(
+                (pl.col(bin_col) - pl.col(poly_col)).alias(out_col)
+            )
+
     return df
 
 
@@ -745,7 +1039,8 @@ _EWMA_SOURCE_COLUMNS = {
     # source_column: (fast_span, slow_span)
     "realized_vol_short": (5, 20),
     "depth_top10_imbalance": (5, 20),
-    "binance_return_1s": (5, 20),
+    "binance_return_1000ms": (5, 20),
+    "binance_return_3000ms": (5, 20),
 }
 
 
@@ -802,13 +1097,14 @@ def add_ewma_features(samples: pl.DataFrame) -> pl.DataFrame:
 def empty_binance_feature_exprs() -> list[pl.Expr]:
     return [
         pl.lit(None, dtype=pl.Float64).alias("binance_mid"),
-        pl.lit(None, dtype=pl.Float64).alias("binance_spread"),
         pl.lit(None, dtype=pl.Float64).alias("binance_book_imbalance"),
-        pl.lit(None, dtype=pl.Float64).alias("binance_return_tick"),
+        pl.lit(None, dtype=pl.Float64).alias("binance_age_ms"),
         pl.lit(None, dtype=pl.Float64).alias("binance_return_100ms"),
+        pl.lit(None, dtype=pl.Float64).alias("binance_return_250ms"),
         pl.lit(None, dtype=pl.Float64).alias("binance_return_500ms"),
-        pl.lit(None, dtype=pl.Float64).alias("binance_return_1s"),
-        pl.lit(None, dtype=pl.Float64).alias("binance_return_3s"),
+        pl.lit(None, dtype=pl.Float64).alias("binance_return_1000ms"),
+        pl.lit(None, dtype=pl.Float64).alias("binance_return_3000ms"),
+        pl.lit(None, dtype=pl.Float64).alias("binance_return_5000ms"),
         *empty_binance_depth_feature_exprs(),
     ]
 
@@ -822,23 +1118,19 @@ def add_research_buckets(samples: pl.DataFrame, enriched: pl.DataFrame | None, t
         df = samples
     else:
         buckets = canonicalize_book(enriched)
-        bucket_cols = [c for c in ["imbalance_bucket", "spread_bucket", "price_bucket", "vol_bucket", "vol_60s"] if c in buckets.columns]
+        bucket_cols = [c for c in ["vol_bucket", "vol_60s"] if c in buckets.columns]
         if not bucket_cols:
             df = samples
         else:
             right = buckets.select(["market_id", "asset_id", "recv_ns", *bucket_cols])
             df = join_asof_by_group(samples.drop([c for c in bucket_cols if c in samples.columns]), right, by=["market_id", "asset_id"], tolerance_ms=tolerance_ms)
-    for col in ["imbalance_bucket", "spread_bucket", "price_bucket", "vol_bucket"]:
+    for col in ["vol_bucket"]:
         if col not in df.columns:
             base = col.replace("_bucket", "")
-            if base == "price":
-                df = add_quantile_bucket(df, "current_mid", col)
-            elif base == "spread":
-                df = add_quantile_bucket(df, "current_spread", col)
-            elif base == "imbalance":
-                df = add_quantile_bucket(df, "top1_imbalance", col)
+            if base == "vol":
+                df = add_threshold_bucket(df, "realized_vol_short", col)
             else:
-                df = df.with_columns(pl.lit("unknown").alias(col))
+                df = df.with_columns(pl.lit(0).alias(col))
     return df
 
 
@@ -1001,9 +1293,6 @@ def infer_feature_columns(df: pl.DataFrame) -> list[str]:
         and not col.startswith(excluded_prefixes)
     ]
     categorical_features = [
-        "imbalance_bucket",
-        "spread_bucket",
-        "price_bucket",
         "vol_bucket",
     ]
     feature_cols.extend([col for col in categorical_features if col in df.columns and col not in feature_cols])
@@ -1077,11 +1366,69 @@ def add_quantile_bucket(df: pl.DataFrame, source_col: str, bucket_col: str, n_bu
         return df.with_columns(pl.lit("q0").alias(bucket_col))
 
 
+def add_threshold_bucket(df: pl.DataFrame, source_col: str, bucket_col: str) -> pl.DataFrame:
+    """Threshold-based bucketing matching live pipeline logic. Returns integer codes."""
+    if source_col not in df.columns:
+        return df.with_columns(pl.lit(0).alias(bucket_col))
+    col = pl.col(source_col)
+    if source_col == "top1_imbalance":
+        # neg_high=0, neg_low=1, pos_low=2, pos_high=3
+        return df.with_columns(
+            pl.when(col < -0.3).then(0)
+            .when(col < 0).then(1)
+            .when(col < 0.3).then(2)
+            .otherwise(3)
+            .alias(bucket_col)
+        )
+    elif source_col == "current_spread":
+        # Use relative spread: spread / mid
+        if "current_mid" in df.columns:
+            rel = col / pl.col("current_mid").clip(lower_bound=0.01)
+            # normal=0, tight=1, wide=2
+            return df.with_columns(
+                pl.when(rel < 0.005).then(0)
+                .when(rel < 0.02).then(1)
+                .otherwise(2)
+                .alias(bucket_col)
+            )
+        else:
+            # Fallback: absolute spread buckets
+            return df.with_columns(
+                pl.when(col < 0.005).then(0)
+                .when(col < 0.02).then(1)
+                .otherwise(2)
+                .alias(bucket_col)
+            )
+    elif source_col == "current_mid":
+        # high=0, low=1, mid=2, very_high=3
+        return df.with_columns(
+            pl.when(col < 0.1).then(0)
+            .when(col < 0.5).then(1)
+            .when(col < 0.9).then(2)
+            .otherwise(3)
+            .alias(bucket_col)
+        )
+    elif source_col == "realized_vol_short":
+        # high=0, low=1, mid=2
+        return df.with_columns(
+            pl.when(col < 0.0001).then(0)
+            .when(col < 0.001).then(1)
+            .otherwise(2)
+            .alias(bucket_col)
+        )
+    return df.with_columns(pl.lit(0).alias(bucket_col))
+
+
 def extract_market_id(text: str | None) -> str:
     if not text:
         return ""
     match = EXPIRY_RE.search(str(text))
     return match.group(0).lower() if match else ""
+
+
+def safe_part_name(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.=-]+", "_", str(value))
+    return safe[:180] or "unknown"
 
 
 def extract_symbol(text: str | None) -> str:

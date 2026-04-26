@@ -20,6 +20,25 @@ from poly.training.splits import chronological_split, split_ranges
 logger = structlog.get_logger()
 
 
+class LGBBoosterWrapper:
+    """Wraps a LightGBM Booster with sklearn-like predict_proba / predict."""
+    def __init__(self, booster, n_features, task="classification"):
+        self.booster = booster
+        self.n_features = n_features
+        self.task = task
+
+    def predict_proba(self, X):
+        raw = self.booster.predict(X)
+        if raw.ndim == 1:
+            return np.column_stack([1 - raw, raw])
+        return raw
+
+    def predict(self, X):
+        if self.task == "classification":
+            return (self.booster.predict(X) >= 0.5).astype(int)
+        return self.booster.predict(X)
+
+
 class Winsorizer(TransformerMixin, BaseEstimator):
     """Clip features to quantile bounds fitted on training data.
 

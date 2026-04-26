@@ -18,6 +18,12 @@ import structlog
 import pandas as pd
 import joblib
 
+# Compatibility shim: models saved with LGBBoosterWrapper from train_full_incremental.py
+# have __main__.LGBBoosterWrapper as their pickle class path. Register it so joblib can load.
+from poly.training.models import LGBBoosterWrapper as _LGBBoosterWrapper
+import __main__ as _main_mod
+_main_mod.LGBBoosterWrapper = _LGBBoosterWrapper
+
 logger = structlog.get_logger()
 
 NS_PER_MS = 1_000_000
@@ -194,9 +200,6 @@ class AssetState:
     outcome: str = ""
     slug: str = ""
     tick_size: float = 0.01
-    min_order_size: float = 1.0
-    maker_base_fee: float = 0.0
-    taker_base_fee: float = 0.0
     expiry_ns: int = 0
 
     # Current book state (from Rust engine)
@@ -216,7 +219,7 @@ class AssetState:
     book_updates_500ms: RollingWindow = field(default_factory=lambda: RollingWindow(500 * NS_PER_MS))
     book_updates_1s: RollingWindow = field(default_factory=lambda: RollingWindow(NS_PER_SECOND))
     spread_deltas_1s: RollingWindow = field(default_factory=lambda: RollingWindow(NS_PER_SECOND))
-    mid_history: deque = field(default_factory=lambda: deque(maxlen=200))
+    mid_history: deque = field(default_factory=lambda: deque(maxlen=500))  # (recv_ns, mid) tuples for time-based returns
 
     # Trade rolling windows
     trades_100ms: RollingWindow = field(default_factory=lambda: RollingWindow(100 * NS_PER_MS))
@@ -244,8 +247,10 @@ class AssetState:
     realized_vol_short_ewma_slow: float | None = None
     depth_top10_imbalance_ewma_fast: float | None = None
     depth_top10_imbalance_ewma_slow: float | None = None
-    binance_return_1s_ewma_fast: float | None = None
-    binance_return_1s_ewma_slow: float | None = None
+    binance_return_1000ms_ewma_fast: float | None = None
+    binance_return_1000ms_ewma_slow: float | None = None
+    binance_return_3000ms_ewma_fast: float | None = None
+    binance_return_3000ms_ewma_slow: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +263,7 @@ class BinanceState:
     mid: float = 0.0
     spread: float = 0.0
     depth_features: dict[str, float | None] = field(default_factory=dict)
-    mid_history: deque = field(default_factory=lambda: deque(maxlen=200))
+    mid_history: deque = field(default_factory=lambda: deque(maxlen=500))  # (recv_ns, mid) tuples
     recent_trade_imbalance: float = 0.0
     last_recv_ns: int = 0
 
@@ -303,20 +308,8 @@ class LiveFeatureAssembler:
 
         # --- Metadata ---
         features["tick_size"] = asset.tick_size
-        features["min_order_size"] = asset.min_order_size
-        features["maker_base_fee"] = asset.maker_base_fee
-        features["taker_base_fee"] = asset.taker_base_fee
 
         # --- LOB derived features ---
-        features["top3_imbalance"] = asset.depth_features.get("depth_top3_imbalance", asset.top1_imbalance)
-        features["top5_imbalance"] = asset.depth_features.get("depth_top5_imbalance", asset.top1_imbalance)
-        features["top10_imbalance"] = asset.depth_features.get("depth_top10_imbalance", asset.top1_imbalance)
-        features["cum_bid_depth_topN_proxy"] = asset.depth_features.get("cum_bid_depth_top10", float(asset.total_bid_levels))
-        features["cum_ask_depth_topN_proxy"] = asset.depth_features.get("cum_ask_depth_top10", float(asset.total_ask_levels))
-        depth10_imb = asset.depth_features.get("depth_top10_imbalance")
-        features["depth_level_imbalance_proxy"] = depth10_imb if depth10_imb is not None else 0.0
-        features["bid_depth_slope"] = asset.depth_features.get("bid_depth_slope_top10")
-        features["ask_depth_slope"] = asset.depth_features.get("ask_depth_slope_top10")
 
         # --- Book event features ---
         features["book_update_count_100ms"] = float(asset.book_updates_100ms.count(now_ns))
@@ -326,7 +319,7 @@ class LiveFeatureAssembler:
         features["spread_widen_count_recent"] = float(sum(1 for d in spread_deltas if d > 0))
         features["spread_narrow_count_recent"] = float(sum(1 for d in spread_deltas if d < 0))
         # Realized vol
-        mid_vals = list(asset.mid_history)
+        mid_vals = [m for _, m in asset.mid_history]
         if len(mid_vals) >= 3:
             rets = np.diff(np.log(np.array(mid_vals[-30:]))) if len(mid_vals) >= 30 else np.diff(np.log(np.array(mid_vals)))
             features["realized_vol_short"] = float(np.std(rets)) if len(rets) > 1 else 0.0
@@ -337,16 +330,12 @@ class LiveFeatureAssembler:
         features["poly_trade_count_100ms"] = float(asset.trades_100ms.count(now_ns))
         features["poly_trade_count_500ms"] = float(asset.trades_500ms.count(now_ns))
         features["poly_trade_count_1s"] = float(asset.trades_1s.count(now_ns))
-        features["poly_trade_count_recent"] = float(asset.trades_1s.count(now_ns))
         buy_vol = asset.buy_vol_1s.sum(now_ns)
         sell_vol = asset.sell_vol_1s.sum(now_ns)
         signed_vol = asset.signed_vol_1s.sum(now_ns)
         features["poly_aggressive_buy_volume_1s"] = buy_vol
         features["poly_aggressive_sell_volume_1s"] = sell_vol
         features["poly_signed_volume_1s"] = signed_vol
-        features["poly_aggressive_buy_volume_recent"] = buy_vol
-        features["poly_aggressive_sell_volume_recent"] = sell_vol
-        features["poly_signed_volume_recent"] = signed_vol
         total_vol = buy_vol + sell_vol
         features["poly_signed_volume_imbalance_recent"] = signed_vol / (total_vol + 1e-12)
         notional_1s = asset.trade_notional_1s.sum(now_ns)
@@ -368,42 +357,57 @@ class LiveFeatureAssembler:
 
         # --- Binance features ---
         features["binance_mid"] = binance.mid
-        features["binance_spread"] = binance.spread
         for key, val in binance.depth_features.items():
             features[f"binance_{key}"] = val
 
-        # Binance returns
-        bin_mids = list(binance.mid_history)
-        if len(bin_mids) >= 2:
-            features["binance_return_tick"] = (bin_mids[-1] - bin_mids[-2]) / bin_mids[-2] if bin_mids[-2] > 0 else 0.0
-        else:
-            features["binance_return_tick"] = 0.0
-        if len(bin_mids) >= 6:
-            features["binance_return_100ms"] = (bin_mids[-1] - bin_mids[-2]) / bin_mids[-2] if bin_mids[-2] > 0 else 0.0
-            features["binance_return_500ms"] = (bin_mids[-1] - bin_mids[-6]) / bin_mids[-6] if bin_mids[-6] > 0 else 0.0
-        else:
-            features["binance_return_100ms"] = 0.0
-            features["binance_return_500ms"] = 0.0
-        if len(bin_mids) >= 11:
-            features["binance_return_1s"] = (bin_mids[-1] - bin_mids[-11]) / bin_mids[-11] if bin_mids[-11] > 0 else 0.0
-        else:
-            features["binance_return_1s"] = 0.0
-        if len(bin_mids) >= 31:
-            features["binance_return_3s"] = (bin_mids[-1] - bin_mids[-31]) / bin_mids[-31] if bin_mids[-31] > 0 else 0.0
-        else:
-            features["binance_return_3s"] = 0.0
+        # Binance returns — timestamp-based
+        bin_history = list(binance.mid_history)  # [(recv_ns, mid), ...]
+        bin_now_mid = binance.mid
+        bin_now_ns = binance.last_recv_ns if binance.last_recv_ns > 0 else now_ns
+        features["binance_age_ms"] = (now_ns - bin_now_ns) / 1e6 if bin_now_ns > 0 else 0.0
+
+        # Offset → (feature suffix, ns offset)
+        _bin_return_offsets = [
+            (100, "100ms"), (250, "250ms"), (500, "500ms"),
+            (1_000, "1000ms"), (3_000, "3000ms"), (5_000, "5000ms"),
+        ]
+        for offset_ms, suffix in _bin_return_offsets:
+            offset_ns = offset_ms * 1_000_000
+            target_ts = bin_now_ns - offset_ns
+            # Scan backwards to find latest entry with ts >= target_ts
+            hist_mid = None
+            for ts, mid in reversed(bin_history):
+                if ts <= target_ts:
+                    hist_mid = mid
+                    break
+            if hist_mid is not None and hist_mid > 0:
+                features[f"binance_return_{suffix}"] = (bin_now_mid / hist_mid - 1) if bin_now_mid > 0 else 0.0
+            else:
+                features[f"binance_return_{suffix}"] = 0.0
         features["binance_recent_trade_imbalance"] = binance.recent_trade_imbalance
 
-        # --- Cross features ---
-        mid_vals = list(asset.mid_history)
-        if len(mid_vals) >= 11:
-            features["poly_return_1s"] = (mid_vals[-1] - mid_vals[-11]) / mid_vals[-11] if mid_vals[-11] > 0 else 0.0
-        else:
-            features["poly_return_1s"] = 0.0
-        features["lead_lag_binance_minus_poly_1s"] = features.get("binance_return_1s", 0.0) - features.get("poly_return_1s", 0.0)
-        features["lead_lag_binance_minus_poly_500ms"] = features.get("binance_return_500ms", 0.0) - (
-            (mid_vals[-1] - mid_vals[-6]) / mid_vals[-6] if len(mid_vals) >= 6 and mid_vals[-6] > 0 else 0.0
-        )
+        # --- Cross features (Poly returns + lead-lag) ---
+        poly_history = list(asset.mid_history)  # [(recv_ns, mid), ...]
+        poly_now_mid = asset.current_mid
+
+        _poly_return_offsets = [(500, "500ms"), (1_000, "1s"), (3_000, "3s")]
+        for offset_ms, suffix in _poly_return_offsets:
+            offset_ns = offset_ms * 1_000_000
+            target_ts = now_ns - offset_ns
+            hist_mid = None
+            for ts, mid in reversed(poly_history):
+                if ts <= target_ts:
+                    hist_mid = mid
+                    break
+            col_name = f"poly_return_{suffix}"
+            if hist_mid is not None and hist_mid > 0:
+                features[col_name] = (poly_now_mid / hist_mid - 1) if poly_now_mid > 0 else 0.0
+            else:
+                features[col_name] = 0.0
+
+        features["lead_lag_binance_minus_poly_1s"] = features.get("binance_return_1000ms", 0.0) - features.get("poly_return_1s", 0.0)
+        features["lead_lag_binance_minus_poly_500ms"] = features.get("binance_return_500ms", 0.0) - features.get("poly_return_500ms", 0.0)
+        features["lead_lag_3s"] = features.get("binance_return_3000ms", 0.0) - features.get("poly_return_3s", 0.0)
 
         # --- EWMA features (incremental update on asset state) ---
         rv = features.get("realized_vol_short")
@@ -428,31 +432,35 @@ class LiveFeatureAssembler:
         else:
             features["depth_top10_imbalance_ewma_diff"] = None
 
-        br1 = features.get("binance_return_1s")
-        asset.binance_return_1s_ewma_fast = _ewma_update(asset.binance_return_1s_ewma_fast, br1, _EWMA_ALPHA_FAST)
-        asset.binance_return_1s_ewma_slow = _ewma_update(asset.binance_return_1s_ewma_slow, br1, _EWMA_ALPHA_SLOW)
-        features["binance_return_1s_ewma_fast"] = asset.binance_return_1s_ewma_fast
-        features["binance_return_1s_ewma_slow"] = asset.binance_return_1s_ewma_slow
-        if asset.binance_return_1s_ewma_fast is not None and asset.binance_return_1s_ewma_slow is not None:
-            features["binance_return_1s_ewma_diff"] = asset.binance_return_1s_ewma_fast - asset.binance_return_1s_ewma_slow
+        br1 = features.get("binance_return_1000ms")
+        asset.binance_return_1000ms_ewma_fast = _ewma_update(asset.binance_return_1000ms_ewma_fast, br1, _EWMA_ALPHA_FAST)
+        asset.binance_return_1000ms_ewma_slow = _ewma_update(asset.binance_return_1000ms_ewma_slow, br1, _EWMA_ALPHA_SLOW)
+        features["binance_return_1000ms_ewma_fast"] = asset.binance_return_1000ms_ewma_fast
+        features["binance_return_1000ms_ewma_slow"] = asset.binance_return_1000ms_ewma_slow
+        if asset.binance_return_1000ms_ewma_fast is not None and asset.binance_return_1000ms_ewma_slow is not None:
+            features["binance_return_1000ms_ewma_diff"] = asset.binance_return_1000ms_ewma_fast - asset.binance_return_1000ms_ewma_slow
         else:
-            features["binance_return_1s_ewma_diff"] = None
+            features["binance_return_1000ms_ewma_diff"] = None
 
-        # --- Categorical buckets (simple thresholds) ---
-        imb = features.get("top1_imbalance", 0.0) or 0.0
-        features["imbalance_bucket"] = "neg_high" if imb < -0.3 else "neg_low" if imb < 0 else "pos_low" if imb < 0.3 else "pos_high"
-        spr = features.get("current_spread", 0.0) or 0.0
-        mid = features.get("current_mid", 0.01) or 0.01
-        rel_spread = spr / mid
-        features["spread_bucket"] = "tight" if rel_spread < 0.005 else "normal" if rel_spread < 0.02 else "wide"
-        features["price_bucket"] = "low" if mid < 0.1 else "mid" if mid < 0.5 else "high" if mid < 0.9 else "very_high"
+        br3 = features.get("binance_return_3000ms")
+        asset.binance_return_3000ms_ewma_fast = _ewma_update(asset.binance_return_3000ms_ewma_fast, br3, _EWMA_ALPHA_FAST)
+        asset.binance_return_3000ms_ewma_slow = _ewma_update(asset.binance_return_3000ms_ewma_slow, br3, _EWMA_ALPHA_SLOW)
+        features["binance_return_3000ms_ewma_fast"] = asset.binance_return_3000ms_ewma_fast
+        features["binance_return_3000ms_ewma_slow"] = asset.binance_return_3000ms_ewma_slow
+        if asset.binance_return_3000ms_ewma_fast is not None and asset.binance_return_3000ms_ewma_slow is not None:
+            features["binance_return_3000ms_ewma_diff"] = asset.binance_return_3000ms_ewma_fast - asset.binance_return_3000ms_ewma_slow
+        else:
+            features["binance_return_3000ms_ewma_diff"] = None
+
+        # --- Categorical buckets (integer-encoded to match training) ---
+        # Training uses polars .to_physical() which assigns codes by sorted category order.
         vol = features.get("realized_vol_short", 0.0) or 0.0
-        features["vol_bucket"] = "low" if vol < 0.0001 else "mid" if vol < 0.001 else "high"
+        features["vol_bucket"] = 0 if vol < 0.0001 else 1 if vol < 0.001 else 2  # high=0, low=1, mid=2
 
         # --- Fill missing features with None/0 ---
         for col in self.feature_columns:
             if col not in features:
-                features[col] = 0.0 if col in self.num_columns else "unknown"
+                features[col] = 0.0
 
         return features
 
@@ -985,7 +993,7 @@ class PredictionPipeline:
 
         # Update metadata if provided
         if metadata:
-            for key in ["tick_size", "min_order_size", "maker_base_fee", "taker_base_fee"]:
+            for key in ["tick_size"]:
                 if key in metadata and metadata[key] is not None:
                     setattr(asset, key, float(metadata[key]))
             for key in ["market_id", "outcome", "slug"]:
@@ -1018,7 +1026,7 @@ class PredictionPipeline:
         asset.book_updates_1s.add(recv_ns, 1.0)
         if prev_spread > 0:
             asset.spread_deltas_1s.add(recv_ns, asset.current_spread - prev_spread)
-        asset.mid_history.append(asset.current_mid)
+        asset.mid_history.append((recv_ns, asset.current_mid))
 
         # Check sampling
         if recv_ns - asset.last_sample_ns < self.sample_interval_ns:
@@ -1066,7 +1074,7 @@ class PredictionPipeline:
         self.binance_state.mid = (float(bids[0][0]) + float(asks[0][0])) / 2
         self.binance_state.spread = float(asks[0][0]) - float(bids[0][0])
         self.binance_state.depth_features = depth_features(bids, asks, max_depth=20)
-        self.binance_state.mid_history.append(self.binance_state.mid)
+        self.binance_state.mid_history.append((recv_ns, self.binance_state.mid))
         self.binance_state.last_recv_ns = recv_ns
 
     def handle_binance_trade(self, side: str, size: float, recv_ns: int) -> None:
@@ -1130,7 +1138,7 @@ class PredictionPipeline:
         for col in self.feature_columns:
             val = feat_dict.get(col)
             if val is None:
-                row[col] = 0.0 if col not in self.cat_columns else "unknown"
+                row[col] = 0.0
             else:
                 row[col] = val
         df = pd.DataFrame([row])
