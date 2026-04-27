@@ -95,7 +95,7 @@ class SignalBroadcaster:
     def broadcast(self, message: dict):
         if not self._clients:
             return
-        data = json.dumps(message)
+        data = json.dumps(message, default=float)
         # Fire-and-forget broadcast to all clients
         for ws in list(self._clients):
             try:
