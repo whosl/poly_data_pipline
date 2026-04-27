@@ -84,13 +84,13 @@ Current live signal gates:
 - signal cooldown
 - max entries per signal key
 
-The current verified Ireland live-shadow policy (`training_eventdriven_20260423` artifacts) uses:
+The current verified Ireland live-shadow policy (`training_combined_20260427` artifacts) uses:
 
 ```text
-fill model = xgboost_classifier
-unwind model = extra_trees_regressor
-threshold = 0.025
-min_p_fill = 0.5
+fill model = rf_classifier (100 trees, depth 12, balanced sampling)
+unwind model = rf_regressor (100 trees, depth 12, balanced sampling)
+threshold = 0.02
+min_p_fill = 0.65
 min_pred_unwind_profit = -0.05
 min_entry_ask = 0.10
 max_entry_ask = 0.90
@@ -100,6 +100,10 @@ signal_cooldown = 10 (defaults to horizon)
 max_entries_per_signal_key = 0 (unlimited)
 POLY_UPDOWN_MARKETS = btc-updown-5m
 ```
+
+Backtest: val avgP=0.1048 (n=2820, WR=91%), test avgP=0.0353 (n=1006, WR=62%).
+
+Note: RF classifier p_fill max ~0.78 in live (vs 0.95+ for boosted models). Lowered thresholds accordingly.
 
 The previous `training_20260422` RF+RF policy used `threshold=0.005, min_p_fill=0.7, min_pred_unwind_profit=0.0` and produced 0 signals after 2000 predictions.
 
@@ -140,7 +144,54 @@ Do not add deep learning yet. The bottleneck is label realism and offline/live a
 
 ## Core Commands
 
-### Latest training_eventdriven_20260423 pipeline
+### Latest: combined 8-model training + evaluation (2026-04-27, Windows)
+
+Phase A: Build partitioned dataset (per-market, memory-efficient):
+
+```bash
+python scripts/train_rf_et_win.py --data-dir data --output-dir artifacts/training_rf_et_win
+```
+
+Phase B: Load balanced + train RF/ET (skip Phase A if already built):
+
+```bash
+python scripts/train_rf_et_win.py --skip-build --max-train-rows 2000000
+```
+
+Combined evaluation (trains LGB/XGB, loads RF/ET, runs 16-combo policy grid):
+
+```bash
+python scripts/combined_policy_eval.py \
+  --parts-dir artifacts/training_rf_et_win/alpha_dataset_parts \
+  --rf-et-dir artifacts/training_rf_et_win \
+  --output-dir artifacts/combined_eval \
+  --max-train-rows 2000000
+```
+
+Deploy to Ireland:
+
+```bash
+scp -4 -i ~/.ssh/EuKey.pem -o StrictHostKeyChecking=no \
+  artifacts/combined_eval/fill_models/*.joblib \
+  ubuntu@108.132.27.76:~/poly_trade_pipeline/artifacts/training_combined_20260427/fill_models/
+
+ssh -4 -i ~/.ssh/EuKey.pem ubuntu@108.132.27.76 \
+  "cd ~/poly_trade_pipeline && .venv/bin/python signal_server.py \
+    --model-path artifacts/training_combined_20260427/fill_models/rf_classifier.joblib \
+    --unwind-model-path artifacts/training_combined_20260427/unwind_models/rf_regressor.joblib \
+    --threshold 0.02 --min-p-fill 0.65 --min-pred-unwind-profit -0.05 \
+    --port 8765 --host 0.0.0.0"
+```
+
+### Previous: training_chrono_purge_20260426 (Ireland)
+
+```bash
+python scripts/train_full_chrono.py \
+  --data-dir artifacts/training_chrono_purge_20260426/alpha_dataset_parts \
+  --output-dir artifacts/training_chrono_purge_20260426
+```
+
+### Previous: training_eventdriven_20260423 pipeline
 
 Build event-driven sampled book:
 

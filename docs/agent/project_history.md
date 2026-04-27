@@ -431,3 +431,58 @@ ssh -4 -i /Users/wenzhuolin/Downloads/LightsailDefaultKey-ap-northeast-1.pem -o 
 ```
 
 See `docs/private/ireland_lightsail.md` and `docs/private/tokyo_lightsail.md` for full connection details.
+
+## RF/ET Training on Windows (2026-04-27)
+
+User migrated to Windows PC (i5-13600KF, 32GB RAM) to train RF/ET models that previously OOM'd on Mac (16GB).
+
+### Phase A: Partitioned Dataset Build
+
+- Script: `scripts/train_rf_et_win.py` — memory-efficient per-market pipeline
+- Used pyarrow predicate pushdown to load one market at a time from `poly_sampled_book` (28M rows/date)
+- Proper canonicalization: `canonicalize_binance_book()` for Binance features
+- Result: 80,326,087 rows across 5 dates, 105 features
+- Output: `artifacts/training_rf_et_win/alpha_dataset_parts/date=YYYYMMDD/market_id=xxx.parquet`
+
+### Phase B: Balanced Sampling + Training
+
+Multiple memory issues resolved:
+1. Polars concat of 11M+ balanced rows → segfault. Fix: convert to numpy immediately per file
+2. Accumulated numpy arrays across 182 markets → OOM. Fix: periodic consolidation every 25 files
+3. Cross-date accumulation → OOM during 3rd date. Fix: early-stop when rows exceed 2× max, incremental cross-date concat
+
+Final config: 2M total train rows (666K/date × 3 dates), balanced sampling (all positives + equal negatives).
+
+Training results (100 estimators, max_depth=12):
+| Model | Time |
+|---|---|
+| rf_classifier | 1.6 min |
+| et_classifier | 1.0 min |
+| rf_regressor | 16.8 min |
+| et_regressor | 12.1 min |
+
+### XGBoost + LightGBM Training
+
+Same 2M balanced dataset used to train 4 additional models:
+- lightgbm_classifier (11s), xgboost_classifier (11s)
+- lightgbm_regressor (8s), xgboost_regressor (11s)
+
+### Combined 8-Model Policy Evaluation
+
+Script: `scripts/combined_policy_eval.py` — trains LGB/XGB, loads RF/ET, batched predictions, full policy grid.
+
+16 combos evaluated. Best test-result combos (entries > 100):
+- **rf_clf × rf_reg**: test avgP=0.0353, n=1,006 (best)
+- xgb_clf × rf_reg: test avgP=0.0271, n=2,112
+- lgb_clf × lgb_reg: test avgP=0.0184, n=2,393
+- lgb_clf × rf_reg: test avgP=0.0157, n=1,371
+
+Key insight: Val overfitting severe — combos with highest val avgP (0.32, 0.20) produce 0 test entries.
+
+### Signal Server Deployment (2026-04-27)
+
+8 models pushed to Ireland (`artifacts/training_combined_20260427/`).
+Signal server restarted with rf_clf × rf_reg:
+- Initial config: threshold=0.05, min_p_fill=0.8 → 0 signals (RF max p_fill=0.78)
+- Adjusted: threshold=0.02, min_p_fill=0.65 → signals producing
+- Log: `~/poly_trade_pipeline/logs/signal_server_rf.log`

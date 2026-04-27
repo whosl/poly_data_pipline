@@ -40,14 +40,18 @@ Do not guess these from current state only.
 
 ## 3. Calibrate The Current Live Models
 
-The current Ireland live-shadow model is already:
+The current Ireland live-shadow model is:
 
-- XGBoost fill classifier
-- ExtraTrees unwind regressor
-- `training_eventdriven_20260423`
+- RF fill classifier (100 trees, depth 12, balanced sampling)
+- RF unwind regressor (100 trees, depth 12, balanced sampling)
+- `training_combined_20260427`
+- Config: threshold=0.02, min_p_fill=0.65, min_unwind=-0.05
 - BTC 5m only
+- RF p_fill max ~0.78 in live (less extreme than boosted models)
 
-Next step is not another deployment. Accumulate at least 500 resolved candidate samples, then run:
+Previous deployments (XGB_clf, LGB_clf) produced 0-1 signals due to conservative p_fill. RF_clf produces signals but with lower p_fill ceiling.
+
+Next step: accumulate at least 500 resolved candidate samples, then run:
 
 ```bash
 python scripts/analyze_live_calibration.py \

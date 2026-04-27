@@ -31,6 +31,11 @@ class DatasetConfig:
     safety_margin_bps: float = 1.0
     join_tolerance_ms: int = 500
     max_null_fraction: float = 0.35
+    sample_mode: str = "time-bucket"
+    book_event_source: str = "book"
+    feature_workers: int = 1
+    symbols: list[str] = field(default_factory=list)
+    periods: list[str] = field(default_factory=list)
 
 
 @dataclass
