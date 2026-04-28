@@ -1,6 +1,6 @@
 # Live Monitoring
 
-This document covers the Ireland live-shadow pipeline. It is for evaluation and monitoring only; it does not place real orders.
+This document covers the Ireland live-shadow pipeline and polybot real execution.
 
 ## Instance And Runtime
 
@@ -13,40 +13,116 @@ docs/private/ireland_lightsail.md
 Last known facts:
 
 - remote repo: `/home/ubuntu/poly_trade_pipeline`
-- tmux session: `poly_live_predict`
-- log file: `/home/ubuntu/poly_trade_pipeline/logs/live_predict.log`
-- live script: `scripts/live_predict.py`
+- Signal server process: `signal_server.py` (WebSocket bridge on port 8765)
+- Polybot process: `poly_bot_copytrade.ts` (Node.js execution bot)
+- tmux sessions: `signal_server`, `poly_bot`
+- Signal server log: `~/poly_trade_pipeline/logs/signal_server_debug.log`
+- Polybot log: `~/poly_bot/logs/bot-YYYY-MM-DD.log`
 - market focus: BTC 5m
 - Binance symbol: `btcusdt`
 
 ## Current Online Model
 
-Latest verified live command on Ireland uses `training_eventdriven_20260423` artifacts:
+Latest verified live command on Ireland uses `training_eventdriven_all5m_80m` artifacts:
 
 ```text
-POLY_UPDOWN_MARKETS=btc-updown-5m \
-python scripts/live_predict.py \
-  --model-path artifacts/training_eventdriven_20260423/fill_models/xgboost_classifier.joblib \
-  --unwind-model-path artifacts/training_eventdriven_20260423/unwind_models/extra_trees_regressor.joblib \
-  --threshold 0.025 \
-  --min-p-fill 0.5 \
-  --min-pred-unwind-profit -0.05 \
-  --sample-interval 100 \
-  --min-entry-ask 0.10 \
-  --max-entry-ask 0.90 \
-  --signal-sample-path logs/live_signal_samples.jsonl \
-  --candidate-sample-path logs/live_candidate_samples.jsonl \
-  --candidate-sample-interval-ms 1000 \
-  --maker-fill-latency-ms 250 \
-  --maker-fill-trade-through-ticks 1.0
+python signal_server.py \
+  --model-path artifacts/training_eventdriven_all5m_80m/fill_models/lightgbm_classifier.joblib \
+  --unwind-model-path artifacts/training_eventdriven_all5m_80m/unwind_models/xgboost_regressor.joblib \
+  --threshold 0.04 --min-p-fill 0.8 --min-pred-unwind-profit -0.05 --port 8765
 ```
 
-Current market scope is BTC 5m only. Recent verification showed `new_market` events only for `btc-updown-5m-*`, with no `btc-updown-15m` in `/tmp/live_predict.log`.
+Current market scope is BTC 5m only.
 
-Historical policy notes:
+## Signal Server Shadow Results (as of 2026-04-28)
 
-- `training_reprofit_20260420_21_5m` with `threshold=0.020, min_p_fill=0.85` produced 0 signals because live p_fill max was ~0.74.
-- `training_20260422` RF+RF with `threshold=0.005, min_p_fill=0.7, min_pred_unwind_profit=0.0` produced 0 signals after 2000 predictions.
+### Overall Stats
+
+| Metric | Value |
+|--------|-------|
+| Total signals broadcast | 388 |
+| Resolved signals | ~388 |
+| Profitable (shadow) | 312/388 = 80.4% |
+| Shadow total profit | +3.022 |
+| Shadow avg profit per signal | +0.00779 |
+| Monitoring horizon | 10s |
+
+### Shadow Profit Breakdown
+
+- Success path (second-leg maker fill): profitable in most cases
+- Unwind path: directionally favorable first-leg moves sometimes yield positive unwind
+- Win rate is high but sample is still small — treat as encouraging, not proven
+
+## Polybot Live Execution Results (as of 2026-04-28)
+
+### Summary
+
+| Metric | Value |
+|--------|-------|
+| First-leg taker fills | 11 |
+| Second-leg maker hedges completed | **0** |
+| Second-leg HEDGE TIMEOUT | 1 |
+| Second-leg `placeSecondSideLimitOrder` returned undefined | 10/11 |
+| All first-leg positions eventually UNWIND | 11/11 |
+
+### First-Leg Fill Details
+
+All 11 first-leg taker buys and their outcomes:
+
+| # | Timestamp | Direction | Ask Price | Gross Shares | Fee (USDC) | Net Shares | Outcome |
+|---|-----------|-----------|-----------|-------------|------------|------------|---------|
+| 1 | 04-28 08:01 | BUY_DOWN | 0.380 | 5.000 | 0.190 | 4.810 | UNWIND |
+| 2 | 04-28 08:01 | BUY_UP | 0.340 | 5.000 | 0.170 | 4.830 | UNWIND |
+| 3 | 04-28 08:01 | BUY_DOWN | 0.380 | 5.000 | 0.190 | 4.810 | UNWIND |
+| 4 | 04-28 08:01 | BUY_UP | 0.340 | 5.000 | 0.170 | 4.830 | UNWIND |
+| 5 | 04-28 08:01 | BUY_DOWN | 0.400 | 5.000 | 0.200 | 4.800 | UNWIND |
+| 6 | 04-28 08:01 | BUY_UP | 0.380 | 5.000 | 0.190 | 4.810 | UNWIND |
+| 7 | 04-28 08:01 | BUY_DOWN | 0.400 | 5.000 | 0.200 | 4.800 | UNWIND |
+| 8 | 04-28 08:01 | BUY_UP | 0.380 | 5.000 | 0.190 | 4.810 | UNWIND |
+| 9 | 04-28 08:04 | BUY_DOWN | 0.560 | 5.000 | 0.280 | 4.720 | UNWIND |
+| 10 | 04-28 08:07 | BUY_DOWN | 0.580 | 5.000 | 0.290 | 4.710 | UNWIND |
+| 11 | 04-28 08:12 | BUY_DOWN | 0.560 | 5.000 | 0.280 | 4.720 | UNWIND |
+
+Notes:
+- Polymarket API `size_matched` returns gross shares
+- Taker fee = `ask_price * gross_shares` (rate varies; ~3.8% observed)
+- Net shares = `gross_shares - fee`
+- All positions eventually unwind — no second-leg hedge was completed
+
+### Signal Server vs Polybot Log Cross-Reference
+
+Matching signal server shadow signals to polybot real trades:
+
+| Signal Server Signal | Polybot Trade | Signal Ask | Polybot Executed Ask | Match? |
+|---------------------|---------------|-----------|---------------------|--------|
+| BUY_DOWN, ask=0.380 | BUY_DOWN, ask=0.380 | 0.380 | 0.380 | Yes |
+| BUY_UP, ask=0.340 | BUY_UP, ask=0.340 | 0.340 | 0.340 | Yes |
+| BUY_DOWN, ask=0.380 | BUY_DOWN, ask=0.380 | 0.380 | 0.380 | Yes |
+| BUY_DOWN, ask=0.400 | BUY_DOWN, ask=0.400 | 0.400 | 0.400 | Yes |
+| BUY_DOWN, ask=0.560 | BUY_DOWN, ask=0.560 | 0.560 | 0.560 | Yes |
+| BUY_DOWN, ask=0.580 | BUY_DOWN, ask=0.580 | 0.580 | 0.580 | Yes |
+| BUY_DOWN, ask=0.560 | BUY_DOWN, ask=0.560 | 0.560 | 0.560 | Yes |
+
+First-leg prices match well between signal server and polybot when executed promptly.
+
+### Orderbook Data Source Comparison
+
+| Aspect | Signal Server | Polybot |
+|--------|--------------|---------|
+| Polymarket WS | Full L2 orderbook events via CLOB WS | Lightweight WS event extraction |
+| Local orderbook | Rust BTreeMap engine, maintained | No local orderbook |
+| Initial snapshot | REST seed on market open | None |
+| Depth tracking | Full depth (all price levels) | Best bid/ask only |
+| Price accuracy | High (maintained BTreeMap) | Dependent on WS event timing |
+| Fill detection | Shadow only (no real orders) | REST polling (~10s delay) |
+
+### Inference Latency
+
+| Metric | Value |
+|--------|-------|
+| Signal server ML inference (p50) | ~23ms |
+| E2E signal → polybot receive | ~26-48ms |
+| Polybot first-leg placement after signal | ~50-100ms |
 
 ## Log Events
 
@@ -111,97 +187,23 @@ profit = second_leg_size * future_same_leg_best_bid - first_leg_price
 
 Do not interpret every unwind as a loss. A directionally favorable first-leg move can make unwind positive.
 
-## Recent Live Results
-
-### Event-Driven XGBoost+ExtraTrees (training_eventdriven_20260423)
-
-Parsed from Ireland `/tmp/live_predict.log`:
-
-| Window | Profitable | Success Path | Total Profit | Avg Profit |
-| --- | ---: | ---: | ---: | ---: |
-| first 23 resolved | 19/23 = 82.6% | 17/23 = 73.9% | `+0.1848` | `+0.0080` |
-| first 30 resolved | 25/30 = 83.3% | 23/30 = 76.7% | `+0.2611` | `+0.0087` |
-| first 33 resolved | 28/33 = 84.8% | 26/33 = 78.8% | `+0.3355` | `+0.0102` |
-
-This is promising but still a small live-shadow sample.
-
-### Earlier Live Runs
-
-Single-model XGBoost and RandomForest looked good offline but lost money live.
-
-Observed live failure pattern:
-
-- maker fill rate much lower than offline labels
-- success branch around `+0.02`
-- unwind losses often around `-0.03` to `-0.05`
-- some extreme price entries had much worse tails
-
-### Previous RF+RF (training_reprofit_20260420_21_5m)
-
-```text
-pred_expected_profit >= 0.020
-p_fill >= 0.85
-pred_unwind_profit >= 0
-```
-
-Result: zero signals after ~9,000 predictions. Live p_fill max ~0.74.
-
-### XGBoost two-stage strict (older artifacts)
-
-```text
-pred_expected_profit >= 0.020814
-p_fill >= 0.85
-pred_unwind_profit >= 0
-```
-
-Result: almost no signals.
-
-### XGBoost two-stage probe (older artifacts)
-
-```text
-pred_expected_profit >= 0.010
-p_fill >= 0.65
-pred_unwind_profit >= -0.02
-```
-
-Result: produced signals but negative; ~50 closed signals averaged about `-0.0259`.
-
-### Single-model RF (training_20260422, threshold=0.67)
-
-Result: 39 signals in 10 minutes, 7.7% accuracy (3/39 profitable), total profit -1.23.
-
-### Two-stage RF+RF (training_20260422, threshold=0.005)
-
-```text
-pred_expected_profit >= 0.005
-p_fill >= 0.7
-pred_unwind_profit >= 0.0
-```
-
-Result: 0 signals after 2000 predictions. Live p_fill max 0.638 (below 0.7), pred_unwind_profit max -0.009 (below 0.0). Train/test distribution shift suspected.
-
 ## How To Check Status
 
 On Ireland:
 
 ```bash
-tmux capture-pane -t poly_live_predict -p -S -120 | tail -120
-ps -eo pid,ppid,pcpu,pmem,etime,cmd --sort=-pcpu | grep -E "live_predict|python" | grep -v grep
-tail -n 200 logs/live_predict.log
-```
+# Signal server
+tmux capture-pane -t signal_server -p -S -120 | tail -120
+tail -n 200 ~/poly_trade_pipeline/logs/signal_server_debug.log
 
-Useful local analysis:
+# Polybot
+tmux capture-pane -t poly_bot -p -S -120 | tail -120
+tail -n 200 ~/poly_bot/logs/bot-$(date +%Y-%m-%d).log
 
-```bash
-python - <<'PY'
-import json
-from pathlib import Path
-p = Path("logs/live_predict.log")
-rows = [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
-print(rows[-5:])
-PY
+# Process check
+ps -eo pid,ppid,pcpu,pmem,etime,cmd --sort=-pcpu | grep -E "signal_server|poly_bot|node" | grep -v grep
 ```
 
 ## Main Risk
 
-The latest event-driven live-shadow run is positive so far, but calibration is not proven. Keep collecting resolved `live_candidate_samples.jsonl`, run `scripts/analyze_live_calibration.py`, and compare live outcomes against offline labels at the same market/asset/timestamp.
+Signal server shadow shows 80.4% win rate but real execution fails to complete second-leg hedges. The core problem is not prediction quality — it is execution. See [Live Execution Issues](live_execution_issues.md) for detailed analysis.

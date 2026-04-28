@@ -11,7 +11,8 @@ Start here, then follow the subdocs:
 - [Features And Labels](agent/features_and_labels.md): current feature columns, label columns, leakage rules, and missing features.
 - [Experiments](agent/experiments.md): key offline results, depth experiments, top10/top20 notes, and known caveats.
 - [Collection And Ops](agent/collection_and_ops.md): collector behavior, default markets, Binance streams, S3/data notes, and Tokyo status.
-- [Live Monitoring](agent/live_monitoring.md): Ireland live-shadow pipeline, logging semantics, current online model, and live failures.
+- [Live Monitoring](agent/live_monitoring.md): Ireland live-shadow pipeline, signal server stats, polybot execution results, and current online model.
+- [Live Execution Issues](agent/live_execution_issues.md): critical problems blocking profitable live execution (second-leg hedge failures, WS fill detection, orderbook divergence).
 - [Next Steps](agent/next_steps.md): the highest-value work from here.
 
 Private instance connection notes are intentionally gitignored:
