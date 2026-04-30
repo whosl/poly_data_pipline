@@ -26,6 +26,7 @@ class DatasetConfig:
     maker_fill_trade_through_ticks: float = 1.0
     fee_rate: float = 0.072
     price_buffer: float = 0.01
+    first_leg_fill_validation_ms: int = 0
     taker_cost_bps: float = 0.0
     slippage_buffer_bps: float = 2.0
     safety_margin_bps: float = 1.0

@@ -7,15 +7,15 @@ poly_bot clients over a local WebSocket.
 
 Usage:
     python signal_server.py \\
-        --model-path artifacts/live_model_snapshot_20260423_eventdriven_full/fill_models/xgboost_classifier.joblib \\
-        --unwind-model-path artifacts/live_model_snapshot_20260423_eventdriven_full/unwind_models/extra_trees_regressor.joblib \\
-        --threshold 0.67 --min-p-fill 0.75 --port 8765
+        --model-path artifacts/training_eventdriven_all5m_80m/fill_models/lightgbm_classifier.joblib \\
+        --unwind-model-path artifacts/training_eventdriven_all5m_80m/unwind_models/xgboost_regressor.joblib \\
+        --threshold 0.04 --min-p-fill 0.8 --min-pred-unwind-profit -0.05 --port 8765
 
 poly_bot connects to ws://localhost:8765 and receives JSON messages:
     {"type":"signal","direction":"BUY_UP","confidence":0.82,"proba":0.82,
-     "decision_score":0.012,"pred_unwind_profit":0.003,"asset_id":"...","timestamp":...}
-    {"type":"prediction","asset_id":"...","proba":0.71,"decision_score":0.008,...}
-    {"type":"tick","up_ask":0.45,"down_ask":0.51,"up_asset":"...","down_asset":"..."}
+     "decisionScore":0.012,"predUnwindProfit":0.003,"assetId":"...","timestamp":...}
+    {"type":"prediction","assetId":"...","proba":0.71,"decisionScore":0.008,...}
+    {"type":"tick","upAsk":0.45,"downAsk":0.51,"up_asset":"...","down_asset":"..."}
 """
 
 from __future__ import annotations
@@ -125,26 +125,26 @@ class SignalBroadcaster:
             "direction": direction,
             "confidence": confidence,
             "proba": proba,
-            "decision_score": decision_score,
-            "pred_unwind_profit": pred_unwind_profit,
-            "pred_expected_profit": pred_expected_profit,
-            "asset_id": asset_id,
-            "opposite_asset_id": opposite_asset_id,
+            "decisionScore": decision_score,
+            "predUnwindProfit": pred_unwind_profit,
+            "predExpectedProfit": pred_expected_profit,
+            "assetId": asset_id,
+            "oppositeAssetId": opposite_asset_id,
             "outcome": outcome,
-            "best_bid": best_bid,
-            "best_ask": best_ask,
+            "bestBid": best_bid,
+            "bestAsk": best_ask,
             "mid": mid,
             "spread": spread,
-            "up_ask": self._last_up_ask,
-            "down_ask": self._last_down_ask,
+            "upAsk": self._last_up_ask,
+            "downAsk": self._last_down_ask,
             "timestamp": int(time.time() * 1000),
         })
 
     def broadcast_tick(self):
         self.broadcast({
             "type": "tick",
-            "up_ask": self._last_up_ask,
-            "down_ask": self._last_down_ask,
+            "upAsk": self._last_up_ask,
+            "downAsk": self._last_down_ask,
             "up_asset": self._up_asset_id,
             "down_asset": self._down_asset_id,
             "timestamp": int(time.time() * 1000),
@@ -186,6 +186,7 @@ class BroadcastingPipeline:
         monitor = self._pipeline.monitor
         if monitor.pending:
             latest = monitor.pending[-1]
+            logger.info('broadcast_check', pending_count=len(monitor.pending), latest_predict_ns=latest.predict_ns, current_recv_ns=recv_ns, latest_signal_id=latest.signal_id, match=latest.predict_ns == recv_ns)
             if latest.predict_ns == recv_ns:
                 # This is a new signal - broadcast it
                 outcome = self._asset_outcome.get(latest.asset_id, asset.outcome)
@@ -243,6 +244,8 @@ class BroadcastingPipeline:
 async def run_server(
     model_path: str,
     unwind_model_path: str | None = None,
+    first_leg_fill_model_path: str | None = None,
+    min_p_first_fill: float = 0.0,
     threshold: float = 0.67,
     min_p_fill: float = 0.75,
     min_pred_unwind_profit: float = 0.0,
@@ -286,10 +289,19 @@ async def run_server(
             logger.error("unwind_model_not_found", path=str(resolved_unwind_path))
             return
 
+    resolved_first_leg_path = None
+    if first_leg_fill_model_path:
+        resolved_first_leg_path = Path(first_leg_fill_model_path)
+        if not resolved_first_leg_path.exists():
+            logger.error("first_leg_fill_model_not_found", path=str(resolved_first_leg_path))
+            return
+
     # Initialize pipeline
     pipeline = PredictionPipeline(
         model_path=resolved_model_path,
         unwind_model_path=resolved_unwind_path,
+        first_leg_fill_model_path=resolved_first_leg_path,
+        min_p_first_fill=min_p_first_fill,
         threshold=threshold,
         min_p_fill=min_p_fill,
         min_pred_unwind_profit=min_pred_unwind_profit,
@@ -322,8 +334,10 @@ async def run_server(
         "ml_signal_server_starting",
         model=str(resolved_model_path),
         unwind_model=str(resolved_unwind_path) if resolved_unwind_path else None,
+        first_leg_fill_model=str(resolved_first_leg_path) if resolved_first_leg_path else None,
         threshold=threshold,
         min_p_fill=min_p_fill,
+        min_p_first_fill=min_p_first_fill,
         port=port,
     )
 
@@ -371,6 +385,14 @@ import click
     default=None,
     help="Path to unwind regressor .joblib model (optional, for two-stage mode).",
 )
+@click.option(
+    "--first-leg-fill-model-path",
+    type=click.Path(path_type=Path, exists=True),
+    default=None,
+    help="Path to first-leg fill classifier .joblib (optional, for 3-stage mode).",
+)
+@click.option("--min-p-first-fill", type=float, default=0.0, show_default=True,
+              help="Min p(first_leg_fill) to allow signal (3-stage gate).")
 @click.option("--threshold", type=float, default=0.67, show_default=True)
 @click.option("--min-p-fill", type=float, default=0.75, show_default=True)
 @click.option("--min-pred-unwind-profit", type=float, default=0.0, show_default=True)
@@ -393,6 +415,8 @@ import click
 def main(
     model_path,
     unwind_model_path,
+    first_leg_fill_model_path,
+    min_p_first_fill,
     threshold,
     min_p_fill,
     min_pred_unwind_profit,
@@ -417,6 +441,8 @@ def main(
     asyncio.run(run_server(
         model_path=str(model_path),
         unwind_model_path=str(unwind_model_path) if unwind_model_path else None,
+        first_leg_fill_model_path=str(first_leg_fill_model_path) if first_leg_fill_model_path else None,
+        min_p_first_fill=min_p_first_fill,
         threshold=threshold,
         min_p_fill=min_p_fill,
         min_pred_unwind_profit=min_pred_unwind_profit,

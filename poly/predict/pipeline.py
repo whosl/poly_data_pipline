@@ -200,6 +200,9 @@ class AssetState:
     outcome: str = ""
     slug: str = ""
     tick_size: float = 0.01
+    min_order_size: float = 1.0
+    maker_base_fee: float = 0.0
+    taker_base_fee: float = 0.0
     expiry_ns: int = 0
 
     # Current book state (from Rust engine)
@@ -308,8 +311,20 @@ class LiveFeatureAssembler:
 
         # --- Metadata ---
         features["tick_size"] = asset.tick_size
+        features["min_order_size"] = asset.min_order_size
+        features["maker_base_fee"] = asset.maker_base_fee
+        features["taker_base_fee"] = asset.taker_base_fee
 
         # --- LOB derived features ---
+        features["top3_imbalance"] = asset.depth_features.get("depth_top3_imbalance", asset.top1_imbalance)
+        features["top5_imbalance"] = asset.depth_features.get("depth_top5_imbalance", asset.top1_imbalance)
+        features["top10_imbalance"] = asset.depth_features.get("depth_top10_imbalance", asset.top1_imbalance)
+        features["cum_bid_depth_topN_proxy"] = asset.depth_features.get("cum_bid_depth_top10", float(asset.total_bid_levels))
+        features["cum_ask_depth_topN_proxy"] = asset.depth_features.get("cum_ask_depth_top10", float(asset.total_ask_levels))
+        depth10_imb = asset.depth_features.get("depth_top10_imbalance")
+        features["depth_level_imbalance_proxy"] = depth10_imb if depth10_imb is not None else 0.0
+        features["bid_depth_slope"] = asset.depth_features.get("bid_depth_slope_top10")
+        features["ask_depth_slope"] = asset.depth_features.get("ask_depth_slope_top10")
 
         # --- Book event features ---
         features["book_update_count_100ms"] = float(asset.book_updates_100ms.count(now_ns))
@@ -330,12 +345,16 @@ class LiveFeatureAssembler:
         features["poly_trade_count_100ms"] = float(asset.trades_100ms.count(now_ns))
         features["poly_trade_count_500ms"] = float(asset.trades_500ms.count(now_ns))
         features["poly_trade_count_1s"] = float(asset.trades_1s.count(now_ns))
+        features["poly_trade_count_recent"] = float(asset.trades_1s.count(now_ns))
         buy_vol = asset.buy_vol_1s.sum(now_ns)
         sell_vol = asset.sell_vol_1s.sum(now_ns)
         signed_vol = asset.signed_vol_1s.sum(now_ns)
         features["poly_aggressive_buy_volume_1s"] = buy_vol
         features["poly_aggressive_sell_volume_1s"] = sell_vol
         features["poly_signed_volume_1s"] = signed_vol
+        features["poly_aggressive_buy_volume_recent"] = buy_vol
+        features["poly_aggressive_sell_volume_recent"] = sell_vol
+        features["poly_signed_volume_recent"] = signed_vol
         total_vol = buy_vol + sell_vol
         features["poly_signed_volume_imbalance_recent"] = signed_vol / (total_vol + 1e-12)
         notional_1s = asset.trade_notional_1s.sum(now_ns)
@@ -357,6 +376,7 @@ class LiveFeatureAssembler:
 
         # --- Binance features ---
         features["binance_mid"] = binance.mid
+        features["binance_spread"] = binance.spread
         for key, val in binance.depth_features.items():
             features[f"binance_{key}"] = val
 
@@ -454,6 +474,13 @@ class LiveFeatureAssembler:
 
         # --- Categorical buckets (integer-encoded to match training) ---
         # Training uses polars .to_physical() which assigns codes by sorted category order.
+        imb = features.get("top1_imbalance", 0.0) or 0.0
+        features["imbalance_bucket"] = 0 if imb < -0.3 else 1 if imb < 0 else 2 if imb < 0.3 else 3  # neg_high=0, neg_low=1, pos_low=2, pos_high=3
+        spr = features.get("current_spread", 0.0) or 0.0
+        mid = features.get("current_mid", 0.01) or 0.01
+        rel_spread = spr / mid
+        features["spread_bucket"] = 0 if rel_spread < 0.005 else 1 if rel_spread < 0.02 else 2  # normal=0, tight=1, wide=2
+        features["price_bucket"] = 0 if mid < 0.1 else 1 if mid < 0.5 else 2 if mid < 0.9 else 3  # high=0, low=1, mid=2, very_high=3
         vol = features.get("realized_vol_short", 0.0) or 0.0
         features["vol_bucket"] = 0 if vol < 0.0001 else 1 if vol < 0.001 else 2  # high=0, low=1, mid=2
 
@@ -503,6 +530,11 @@ class PendingPrediction:
     future_mid_at_resolve: float | None = None
     tick_size_at_entry: float = 0.01
     track_stats: bool = True
+    # First-leg fill validation: track whether best_ask stayed at/below entry
+    # long enough after signal to realistically fill.
+    first_leg_fill_price: float = 0.0  # entry_price + price_buffer
+    first_leg_observed_fill_ns: int | None = None  # ns when best_ask <= fill_price first seen
+    first_leg_missed: bool = False  # True if best_ask never dropped to fill_price
 
 
 @dataclass
@@ -603,6 +635,27 @@ class OutcomeMonitor:
                         fill_lag_ms=fmt_ms(recv_ns - pred.predict_ns),
                     )
 
+    def observe_first_leg_price(
+        self, asset_id: str, best_ask: float | None, recv_ns: int
+    ) -> None:
+        """Track whether the first-leg taker order could realistically fill.
+
+        A first-leg BUY at (entry_ask + price_buffer) is considered fillable
+        if best_ask stays at or below that price for long enough after the
+        signal. We record the first time best_ask <= fill_price.
+        """
+        if best_ask is None:
+            return
+        for pred in self.pending:
+            if pred.first_leg_observed_fill_ns is not None:
+                continue
+            if pred.asset_id != asset_id:
+                continue
+            if pred.first_leg_fill_price <= 0:
+                continue
+            if best_ask <= pred.first_leg_fill_price + 1e-12:
+                pred.first_leg_observed_fill_ns = recv_ns
+
     def check_outcomes(
         self,
         now_ns: int,
@@ -638,6 +691,19 @@ class OutcomeMonitor:
         - If a future opposite trade fills that quote within the horizon → success
         - Otherwise → failure, unwind the first leg at future same-leg best_bid
         """
+        # First-leg fill validation: if best_ask never dropped to the fill price
+        # during the monitoring window, the first leg never entered.
+        if pred.first_leg_fill_price > 0 and pred.first_leg_observed_fill_ns is None:
+            pred.first_leg_missed = True
+            if pred.track_stats:
+                self.stats.total_resolved += 1
+            return {
+                "result": "missed",
+                "profit": 0.0,
+                "first_leg_price": pred.first_leg_fill_price,
+                "reason": "best_ask never <= first_leg_fill_price during horizon",
+            }
+
         # Compute entry parameters (same as labels.py formula)
         entry_price = pred.best_ask_at_entry
         first_leg_price = entry_price + pred.price_buffer
@@ -753,6 +819,8 @@ class PredictionPipeline:
         self,
         model_path: str | Path,
         unwind_model_path: str | Path | None = None,
+        first_leg_fill_model_path: str | Path | None = None,
+        min_p_first_fill: float = 0.0,
         threshold: float = 0.6,
         min_p_fill: float = 0.0,
         min_pred_unwind_profit: float = -1.0,
@@ -778,6 +846,7 @@ class PredictionPipeline:
         self.threshold = threshold
         self.min_p_fill = min_p_fill
         self.min_pred_unwind_profit = min_pred_unwind_profit
+        self.min_p_first_fill = min_p_first_fill
         self.sample_interval_ns = sample_interval_ms * NS_PER_MS
         self.min_price_change = min_price_change
         self.horizon_seconds = horizon_seconds
@@ -809,6 +878,13 @@ class PredictionPipeline:
             self.unwind_pipeline = unwind_blob["model"]
             force_single_thread_inference(self.unwind_pipeline, name="unwind")
             unwind_feature_cols = unwind_blob.get("feature_columns", [])
+        self.first_leg_fill_pipeline = None
+        first_leg_feature_cols: list[str] = []
+        if first_leg_fill_model_path is not None:
+            fl_blob = joblib.load(str(first_leg_fill_model_path))
+            self.first_leg_fill_pipeline = fl_blob["model"]
+            force_single_thread_inference(self.first_leg_fill_pipeline, name="first_leg_fill")
+            first_leg_feature_cols = fl_blob.get("feature_columns", [])
         model_feature_cols = blob.get("feature_columns", [])
 
         # Load training metadata for feature column order
@@ -826,8 +902,12 @@ class PredictionPipeline:
         for col in unwind_feature_cols:
             if col not in self.feature_columns:
                 self.feature_columns.append(col)
+        for col in first_leg_feature_cols:
+            if col not in self.feature_columns:
+                self.feature_columns.append(col)
         self.model_feature_columns = model_feature_cols or self.feature_columns
         self.unwind_feature_columns = unwind_feature_cols or self.feature_columns
+        self.first_leg_feature_columns = first_leg_feature_cols or self.feature_columns
 
         self.assembler = LiveFeatureAssembler(self.feature_columns, self.cat_columns)
         self.monitor = OutcomeMonitor(
@@ -993,7 +1073,7 @@ class PredictionPipeline:
 
         # Update metadata if provided
         if metadata:
-            for key in ["tick_size"]:
+            for key in ["tick_size", "min_order_size", "maker_base_fee", "taker_base_fee"]:
                 if key in metadata and metadata[key] is not None:
                     setattr(asset, key, float(metadata[key]))
             for key in ["market_id", "outcome", "slug"]:
@@ -1149,6 +1229,9 @@ class PredictionPipeline:
         pred_unwind_profit = None
         pred_expected_profit = None
         decision_score = proba
+        p_first_leg_fill = None
+        if self.first_leg_fill_pipeline is not None:
+            p_first_leg_fill = float(self.first_leg_fill_pipeline.predict_proba(df[self.first_leg_feature_columns])[0, 1])
         if self.unwind_pipeline is not None:
             pred_unwind_profit = float(self.unwind_pipeline.predict(df[self.unwind_feature_columns])[0])
 
@@ -1176,6 +1259,7 @@ class PredictionPipeline:
             crossed_threshold = prev_score is None or prev_score < self.threshold
         p_fill_ok = proba >= self.min_p_fill
         unwind_ok = pred_unwind_profit is None or pred_unwind_profit >= self.min_pred_unwind_profit
+        first_leg_ok = p_first_leg_fill is None or p_first_leg_fill >= self.min_p_first_fill
         signal = (
             raw_signal
             and crossed_threshold
@@ -1185,6 +1269,7 @@ class PredictionPipeline:
             and structural_entry_filter_ok
             and p_fill_ok
             and unwind_ok
+            and first_leg_ok
         )
         if signal or self.monitor.stats.total_predictions % self._score_sample_interval == 0:
             self._score_window.append(
@@ -1193,6 +1278,7 @@ class PredictionPipeline:
                     "pred_unwind_profit": pred_unwind_profit,
                     "pred_expected_profit": pred_expected_profit,
                     "decision_score": float(decision_score),
+                    "p_first_leg_fill": p_first_leg_fill,
                 }
             )
         self._record_gate_counts(
@@ -1248,6 +1334,7 @@ class PredictionPipeline:
                 price_buffer=self.price_buffer,
                 second_leg_quote_price=second_leg_quote_price,
                 tick_size_at_entry=asset.tick_size,
+                first_leg_fill_price=asset.best_ask + self.price_buffer,
             )
             self.monitor.add_signal(pred)
             self._write_signal_open_sample(pred)
@@ -1280,6 +1367,7 @@ class PredictionPipeline:
                 tte_seconds=f"{tte:.1f}",
                 first_leg_price=fmt_price(first_leg_price),
                 price_buffer=fmt_price(self.price_buffer),
+                p_first_leg_fill=fmt_float(p_first_leg_fill),
                 fee_per_share=fmt_float(fee_per_share),
                 second_leg_size=fmt_float(second_leg_size),
                 second_leg_quote=fmt_price(second_leg_quote_price),
@@ -1330,10 +1418,33 @@ class PredictionPipeline:
                 "best_ask": state.best_ask,
                 "current_mid": state.current_mid,
             }
+            self.monitor.observe_first_leg_price(aid, state.best_ask, recv_ns)
         resolved = self.monitor.check_outcomes(recv_ns, asset_books)
         for pred, details in resolved:
             profit = float(details["profit"])
             result = str(details["result"])
+            if result == "missed":
+                if pred.track_stats:
+                    logger.info(
+                        "signal_close",
+                        signal_id=pred.signal_id,
+                        signal_key=pred.signal_key,
+                        signal_seq_for_key=pred.signal_seq_for_key,
+                        slug=short_slug(pred.slug),
+                        outcome_pred=pred.outcome,
+                        asset=short_id(pred.asset_id),
+                        opposite_asset=short_id(pred.opposite_asset_id),
+                        proba=f"{pred.proba:.6f}",
+                        decision_score=fmt_float(pred.decision_score),
+                        p_fill=f"{pred.proba:.6f}",
+                        result=result,
+                        profit=f"{profit:+.6f}",
+                        entry_ask=fmt_price(pred.best_ask_at_entry),
+                        first_leg_price=fmt_price(float(details["first_leg_price"])),
+                        reason=details.get("reason", ""),
+                        running=self.monitor.stats.summary(),
+                    )
+                continue
             if pred.track_stats:
                 logger.info(
                     "signal_close",

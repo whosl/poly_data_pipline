@@ -486,3 +486,72 @@ Signal server restarted with rf_clf × rf_reg:
 - Initial config: threshold=0.05, min_p_fill=0.8 → 0 signals (RF max p_fill=0.78)
 - Adjusted: threshold=0.02, min_p_fill=0.65 → signals producing
 - Log: `~/poly_trade_pipeline/logs/signal_server_rf.log`
+
+## 3-Stage Model Architecture (2026-04-30)
+
+### Problem Statement
+
+Live execution showed many first-leg taker orders don't fill within the 10s timeout — they get cancelled. The 2-stage model (fill classifier + unwind regressor) conflates both legs in the fill target. A 3-stage architecture was needed:
+
+1. **Stage 1**: First-leg fill classifier — predict if taker buy at `best_ask` fills within ~350ms
+2. **Stage 2**: Second-leg fill classifier — predict if opposite-side maker order fills
+3. **Stage 3**: Unwind profit regressor — predict PnL if second-leg fails
+
+### Label: `y_first_leg_fill`
+
+Added `add_first_leg_fill_labels()` to `poly/training/labels.py`:
+- Forward-looking label: checks if `best_ask` stays ≤ `best_ask_at_signal + price_buffer` within a 500ms window
+- Uses two-pointer sliding window per asset for efficient computation
+- High fill rate (~90%+) for taker orders near best_ask
+
+### Training Script: `scripts/three_stage_eval.py`
+
+Trains 12 models (4 per stage):
+- Stage 1: s1_xgb, s1_rf, s1_et, s1_lgb classifiers on `y_first_leg_fill`
+- Stage 2: s2_xgb, s2_rf, s2_et, s2_lgb classifiers on `y_two_leg_entry_binary_10s`
+- Stage 3: s3_xgb, s3_rf, s3_et, s3_lgb regressors on `first_unwind_profit_proxy_10s`
+
+Key design decision: `p_first` is a GATE, not a multiplier in expected profit. The formula:
+```
+ep = p_second * spread_profit + (1-p_second) * pred_unwind
+Gate: p_first >= min_p_first_fill & ep >= threshold & pred_unwind >= min_unwind & p_second >= min_p_fill
+```
+
+### Deep Analysis: `scripts/three_stage_deep_analysis.py`
+
+Compares 3-stage threshold selection vs 2-stage top-N selection:
+- Top-N by expected profit (fair same-sample comparison)
+- Overlap analysis between 3-stage and 2-stage signal sets
+- Bucket analysis by p_first showing performance at different fill probability levels
+
+### Best Result: s1_xgb + s2_et + s3_et
+
+Test metrics (threshold selection):
+- 364 signals, **95.1% win rate**, avgP=+0.1009, totalP=+36.7
+- 0% overlap with 2-stage selections — completely different signal universe
+- Key insight: p_first < 0.90 bucket has best avgP — Stage 1 identifies high-volatility high-alpha entries
+
+### Pipeline Changes
+
+Files modified:
+- `poly/training/labels.py` — added `add_first_leg_fill_labels()`
+- `poly/training/features.py` — wired first-leg fill label into `build_feature_frame()`
+- `poly/predict/pipeline.py` — added `first_leg_fill_model_path`, `min_p_first_fill`, 3-stage inference
+- `signal_server.py` — added `--first-leg-fill-model-path` and `--min-p-first-fill` CLI options
+- `scripts/live_predict.py` — added first-leg fill model support
+
+### Deployment to Ireland (2026-04-30)
+
+3 models pushed to Ireland (`artifacts/three_stage_eval/`):
+- `fill_models/s1_xgb.joblib` (Stage 1)
+- `fill_models/s2_et.joblib` (Stage 2)
+- `unwind_models/s3_et.joblib` (Stage 3)
+
+Signal server restarted with 3-stage config:
+```bash
+python signal_server.py \
+  --model-path artifacts/three_stage_eval/fill_models/s2_et.joblib \
+  --unwind-model-path artifacts/three_stage_eval/unwind_models/s3_et.joblib \
+  --first-leg-fill-model-path artifacts/three_stage_eval/fill_models/s1_xgb.joblib \
+  --threshold 0.05 --min-p-fill 0.7 --min-p-first-fill 0.5 --min-pred-unwind-profit -0.05
+```

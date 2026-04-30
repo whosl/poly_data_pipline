@@ -96,7 +96,12 @@ class OrderBookEngine:
     def handle_price_change(
         self, asset_id: str, side: str, price: str, size: str, exchange_ts: int
     ) -> dict[str, Any] | None:
-        """Apply a delta; only recompute full depth_summary when midpoint moved."""
+        """Apply a delta; only recompute full depth_summary when midpoint moved.
+
+        When the midpoint barely moves, returns a quick_summary (no depth
+        features) but preserves the cached full depth_summary so that
+        get_features() still returns depth features from the last full compute.
+        """
         book = self.get_or_create(asset_id)
         book.apply_delta(side, price, size, exchange_ts)
 
@@ -111,8 +116,19 @@ class OrderBookEngine:
         if prev_mid is not None and prev_mid > 0:
             rel_change = abs(new_mid - prev_mid) / prev_mid
             if rel_change < self.midpoint_threshold:
-                # Midpoint barely moved — return cheap summary.
-                return book.quick_summary()
+                # Midpoint barely moved — return cheap summary but patch the
+                # cached full summary with updated top-of-book fields so
+                # get_features() returns depth features + current prices.
+                qs = book.quick_summary()
+                cached = self._last_summary.get(asset_id)
+                if cached is not None:
+                    for key in ("best_bid", "best_bid_size", "best_ask",
+                                "best_ask_size", "spread", "midpoint",
+                                "microprice", "imbalance", "total_bid_levels",
+                                "total_ask_levels", "last_exchange_ts"):
+                        if key in qs:
+                            cached[key] = qs[key]
+                return qs
 
         # Midpoint moved beyond threshold (or first update) — full recompute.
         summary = book.depth_summary()

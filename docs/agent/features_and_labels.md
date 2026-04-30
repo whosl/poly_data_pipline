@@ -188,6 +188,13 @@ Future book labels:
 - `future_best_ask_5s`
 - `future_best_ask_10s`
 
+First-leg fill label:
+
+- `y_first_leg_fill_500ms` — 1 if `best_ask` in next snapshot (within 500ms) stays ≤ `best_ask_at_signal + price_buffer`, else 0
+- Implementation: `add_first_leg_fill_labels()` in `poly/training/labels.py`
+- Uses two-pointer sliding window over per-asset forward snapshots
+- Live label window: 350ms (accounts for ~350ms latency between signal and order)
+
 Two-leg labels:
 
 - `opposite_asset_id`

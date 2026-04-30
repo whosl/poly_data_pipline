@@ -17,6 +17,7 @@ from poly.training.labels import (
     add_alpha_labels,
     add_entry_net_edge,
     add_final_profit_labels,
+    add_first_leg_fill_labels,
     add_strategy_entry_labels,
     add_two_leg_maker_fill_labels,
     maker_fill_label_design,
@@ -28,6 +29,7 @@ NS_PER_MS = 1_000_000
 NS_PER_SECOND = 1_000_000_000
 EXPIRY_RE = re.compile(r"(?P<symbol>btc|eth)-updown-(?P<period>5m|15m)-(?P<expiry>\d+)", re.I)
 DEPTH_FEATURE_COLUMNS = [
+    "depth_top1_imbalance",
     "depth_top3_imbalance",
     "depth_top5_imbalance",
     "depth_top10_imbalance",
@@ -356,6 +358,13 @@ def build_feature_frame(
         maker_fill_trade_side=config.two_leg_maker_fill_trade_side,
         maker_fill_latency_ms=config.maker_fill_latency_ms,
         maker_fill_trade_through_ticks=config.maker_fill_trade_through_ticks,
+        first_leg_fill_validation_ms=config.first_leg_fill_validation_ms,
+        price_buffer=config.price_buffer,
+    )
+    samples = add_first_leg_fill_labels(
+        samples,
+        validation_ms=config.first_leg_fill_validation_ms if config.first_leg_fill_validation_ms > 0 else 350,
+        price_buffer=config.price_buffer,
     )
     samples = add_final_profit_labels(
         samples,
@@ -557,9 +566,15 @@ def canonicalize_book(book: pl.DataFrame) -> pl.DataFrame:
         "total_bid_levels",
         "total_ask_levels",
         *DEPTH_FEATURE_COLUMNS,
+        "imbalance_bucket",
+        "spread_bucket",
+        "price_bucket",
         "vol_bucket",
         "vol_60s",
         "tick_size",
+        "min_order_size",
+        "maker_base_fee",
+        "taker_base_fee",
         "volume_24h",
         "liquidity",
     ]
@@ -595,6 +610,21 @@ def add_lob_features(samples: pl.DataFrame) -> pl.DataFrame:
             df = df.with_columns(pl.lit(None).alias(col))
     df = df.with_columns(
         [
+            # Use real top-N imbalance from depth features when available;
+            # fall back to top1 proxy for old data that lacks depth columns.
+            pl.coalesce([pl.col("depth_top3_imbalance"), pl.col("top1_imbalance")]).alias("top3_imbalance"),
+            pl.coalesce([pl.col("depth_top5_imbalance"), pl.col("top1_imbalance")]).alias("top5_imbalance"),
+            pl.coalesce([pl.col("depth_top10_imbalance"), pl.col("top1_imbalance")]).alias("top10_imbalance"),
+            # Use real cumulative depth when available; fall back to level-count proxy.
+            pl.coalesce([pl.col("cum_bid_depth_top10"), pl.col("total_bid_levels").cast(pl.Float64)]).alias("cum_bid_depth_topN_proxy"),
+            pl.coalesce([pl.col("cum_ask_depth_top10"), pl.col("total_ask_levels").cast(pl.Float64)]).alias("cum_ask_depth_topN_proxy"),
+            pl.coalesce(
+                [pl.col("depth_top10_imbalance"),
+                 (pl.col("total_bid_levels").cast(pl.Float64) - pl.col("total_ask_levels").cast(pl.Float64))]
+            ).alias("depth_level_imbalance_proxy"),
+            # Use real depth slope when available; fall back to None.
+            pl.coalesce([pl.col("bid_depth_slope_top10"), pl.lit(None, dtype=pl.Float64)]).alias("bid_depth_slope"),
+            pl.coalesce([pl.col("ask_depth_slope_top10"), pl.lit(None, dtype=pl.Float64)]).alias("ask_depth_slope"),
             pl.lit(None, dtype=pl.Float64).alias("queue_depletion_proxy"),
         ]
     )
@@ -756,9 +786,13 @@ def add_trade_features(samples: pl.DataFrame, trades: pl.DataFrame) -> pl.DataFr
             "poly_trade_count_100ms",
             "poly_trade_count_500ms",
             "poly_trade_count_1s",
+            "poly_trade_count_recent",
             "poly_aggressive_buy_volume_1s",
             "poly_aggressive_sell_volume_1s",
             "poly_signed_volume_1s",
+            "poly_aggressive_buy_volume_recent",
+            "poly_aggressive_sell_volume_recent",
+            "poly_signed_volume_recent",
             "poly_signed_volume_imbalance_recent",
             "poly_recent_vwap",
             "poly_sweep_indicator_proxy",
@@ -777,9 +811,13 @@ def empty_trade_feature_exprs() -> list[pl.Expr]:
         pl.lit(0.0).alias("poly_trade_count_100ms"),
         pl.lit(0.0).alias("poly_trade_count_500ms"),
         pl.lit(0.0).alias("poly_trade_count_1s"),
+        pl.lit(0.0).alias("poly_trade_count_recent"),
         pl.lit(0.0).alias("poly_aggressive_buy_volume_1s"),
         pl.lit(0.0).alias("poly_aggressive_sell_volume_1s"),
         pl.lit(0.0).alias("poly_signed_volume_1s"),
+        pl.lit(0.0).alias("poly_aggressive_buy_volume_recent"),
+        pl.lit(0.0).alias("poly_aggressive_sell_volume_recent"),
+        pl.lit(0.0).alias("poly_signed_volume_recent"),
         pl.lit(0.0).alias("poly_signed_volume_imbalance_recent"),
         pl.lit(None, dtype=pl.Float64).alias("poly_recent_vwap"),
         pl.lit(None, dtype=pl.Float64).alias("poly_recent_vwap_deviation"),
@@ -815,6 +853,7 @@ def canonicalize_binance_book(tables: dict[str, TableLoadResult]) -> pl.DataFram
             "asset_id": "binance_asset_id",
             "symbol": "binance_symbol",
             "current_mid": "binance_mid",
+            "current_spread": "binance_spread",
             "top1_imbalance": "binance_book_imbalance",
         }
     ).sort("recv_ns")
@@ -1097,6 +1136,7 @@ def add_ewma_features(samples: pl.DataFrame) -> pl.DataFrame:
 def empty_binance_feature_exprs() -> list[pl.Expr]:
     return [
         pl.lit(None, dtype=pl.Float64).alias("binance_mid"),
+        pl.lit(None, dtype=pl.Float64).alias("binance_spread"),
         pl.lit(None, dtype=pl.Float64).alias("binance_book_imbalance"),
         pl.lit(None, dtype=pl.Float64).alias("binance_age_ms"),
         pl.lit(None, dtype=pl.Float64).alias("binance_return_100ms"),
@@ -1118,16 +1158,22 @@ def add_research_buckets(samples: pl.DataFrame, enriched: pl.DataFrame | None, t
         df = samples
     else:
         buckets = canonicalize_book(enriched)
-        bucket_cols = [c for c in ["vol_bucket", "vol_60s"] if c in buckets.columns]
+        bucket_cols = [c for c in ["imbalance_bucket", "spread_bucket", "price_bucket", "vol_bucket", "vol_60s"] if c in buckets.columns]
         if not bucket_cols:
             df = samples
         else:
             right = buckets.select(["market_id", "asset_id", "recv_ns", *bucket_cols])
             df = join_asof_by_group(samples.drop([c for c in bucket_cols if c in samples.columns]), right, by=["market_id", "asset_id"], tolerance_ms=tolerance_ms)
-    for col in ["vol_bucket"]:
+    for col in ["imbalance_bucket", "spread_bucket", "price_bucket", "vol_bucket"]:
         if col not in df.columns:
             base = col.replace("_bucket", "")
-            if base == "vol":
+            if base == "price":
+                df = add_threshold_bucket(df, "current_mid", col)
+            elif base == "spread":
+                df = add_threshold_bucket(df, "current_spread", col)
+            elif base == "imbalance":
+                df = add_threshold_bucket(df, "top1_imbalance", col)
+            elif base == "vol":
                 df = add_threshold_bucket(df, "realized_vol_short", col)
             else:
                 df = df.with_columns(pl.lit(0).alias(col))
@@ -1293,6 +1339,9 @@ def infer_feature_columns(df: pl.DataFrame) -> list[str]:
         and not col.startswith(excluded_prefixes)
     ]
     categorical_features = [
+        "imbalance_bucket",
+        "spread_bucket",
+        "price_bucket",
         "vol_bucket",
     ]
     feature_cols.extend([col for col in categorical_features if col in df.columns and col not in feature_cols])

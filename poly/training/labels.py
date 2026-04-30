@@ -101,6 +101,8 @@ def add_two_leg_maker_fill_labels(
     maker_fill_latency_ms: int = 250,
     maker_fill_trade_through_ticks: float = 1.0,
     tick_size_fallback: float = 0.01,
+    first_leg_fill_validation_ms: int = 0,
+    price_buffer: float = 0.01,
 ) -> pl.DataFrame:
     """Label whether a taker first leg plus future opposite maker fill clears max total price.
 
@@ -172,7 +174,7 @@ def add_two_leg_maker_fill_labels(
         else pl.lit(tick_size_fallback)
     )
 
-    return (
+    result = (
         working.with_columns(
             [
                 pl.Series("opposite_asset_id", opposite_by_row),
@@ -213,7 +215,109 @@ def add_two_leg_maker_fill_labels(
                 (pl.col(edge_col).is_not_null() & (pl.col(edge_col) >= 0)).cast(pl.Int8).alias(binary_col),
             ]
         )
-        .drop([candidate_fill_price_col, candidate_fill_ts_col, fill_threshold_col, quote_col, tick_col, "_row_nr"], strict=False)
+    )
+
+    # First-leg fill validation: check if best_ask stayed at/below fill price
+    # within validation window. If price moved away, the first leg couldn't fill
+    # so this row should not be labeled as "enter".
+    if first_leg_fill_validation_ms > 0:
+        validation_ns = first_leg_fill_validation_ms * 1_000_000
+        fill_price = pl.col("best_ask") + pl.lit(price_buffer)
+        result = result.sort(["asset_id", "recv_ns"]).with_columns(
+            [
+                pl.col("best_ask").shift(-1).over("asset_id").alias("_next_best_ask"),
+                pl.col("recv_ns").shift(-1).over("asset_id").alias("_next_recv_ns"),
+            ]
+        ).with_columns(
+            [
+                # Next row is within validation window AND price moved above fill_price
+                pl.when(
+                    pl.col("_next_recv_ns").is_not_null()
+                    & ((pl.col("_next_recv_ns") - pl.col("recv_ns")) <= pl.lit(validation_ns))
+                    & (pl.col("_next_best_ask") > fill_price)
+                )
+                .then(pl.lit("skip"))
+                .otherwise(pl.col(cls_col))
+                .alias(cls_col),
+                pl.when(
+                    pl.col("_next_recv_ns").is_not_null()
+                    & ((pl.col("_next_recv_ns") - pl.col("recv_ns")) <= pl.lit(validation_ns))
+                    & (pl.col("_next_best_ask") > fill_price)
+                )
+                .then(pl.lit(0))
+                .otherwise(pl.col(binary_col))
+                .alias(binary_col),
+            ]
+        ).drop(["_next_best_ask", "_next_recv_ns"])
+
+    return result.drop([candidate_fill_price_col, candidate_fill_ts_col, fill_threshold_col, quote_col, tick_col, "_row_nr"], strict=False)
+
+
+def add_first_leg_fill_labels(
+    samples: pl.DataFrame,
+    validation_ms: int = 350,
+    price_buffer: float = 0.01,
+) -> pl.DataFrame:
+    """Label whether the first-leg taker buy at best_ask would fill after latency.
+
+    Scans ALL future snapshots within the validation window (not just the next
+    one). A fill fails if ANY future best_ask exceeds entry_ask + price_buffer
+    within the window. This models the bot's end-to-end latency: the order
+    reaches the exchange validation_ms after the orderbook snapshot.
+
+    Uses a two-pointer sliding-window-max approach per asset for efficiency.
+    """
+    label_col = "y_first_leg_fill"
+    if samples.is_empty():
+        return samples.with_columns(pl.lit(None).cast(pl.Int8).alias(label_col))
+
+    validation_ns = validation_ms * 1_000_000
+    samples = samples.sort(["asset_id", "recv_ns"])
+
+    asset_ids = samples["asset_id"].to_numpy()
+    recv_ns = samples["recv_ns"].to_numpy().astype(np.int64)
+    best_ask = samples["best_ask"].to_numpy().astype(np.float64)
+
+    n = len(samples)
+    labels = np.ones(n, dtype=np.int8)  # default: fill
+
+    # Per-asset two-pointer sliding window max
+    unique_assets = np.unique(asset_ids)
+    for asset in unique_assets:
+        mask = asset_ids == asset
+        idx = np.where(mask)[0]
+        a_ns = recv_ns[idx]
+        a_ask = best_ask[idx]
+        m = len(idx)
+
+        j = 0
+        for i in range(m):
+            entry_ask = a_ask[i]
+            threshold = entry_ask + price_buffer
+            end_time = a_ns[i] + validation_ns
+
+            if j < i + 1:
+                j = i + 1
+            # Scan forward — check if any snapshot in window has ask > threshold
+            while j < m and a_ns[j] <= end_time:
+                if a_ask[j] > threshold:
+                    labels[idx[i]] = 0
+                    break
+                j += 1
+            # Reset j for next row only if it went too far
+            if j > i + 1:
+                j = i + 1
+
+    # Null out rows where best_ask is null or no future data
+    ask_null = np.isnan(best_ask)
+    labels[ask_null] = -1  # sentinel for null
+
+    return samples.with_columns(
+        pl.when(pl.Series(labels) == -1)
+        .then(None)
+        .otherwise(pl.Series(labels))
+        .cast(pl.Int8)
+        .alias(label_col)
     )
 
 

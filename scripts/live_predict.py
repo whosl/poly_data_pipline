@@ -236,8 +236,6 @@ async def _run_poly_ws(
 
 def _dispatch_poly(msg: dict, recv_ns: int, subscribed: dict, engine: OrderBookEngine,
                    pipeline: PredictionPipeline, metadata: dict) -> None:
-    from poly.engine.orderbook import extract_depth_features
-
     event_type = msg.get("event_type")
     if event_type == "book":
         asset_id = msg.get("asset_id", "")
@@ -259,9 +257,30 @@ def _dispatch_poly(msg: dict, recv_ns: int, subscribed: dict, engine: OrderBookE
             side = change.get("side", "BUY").lower()
             price = change.get("price", "0")
             size = change.get("size", "0")
-            features = engine.handle_price_change(asset_id, side, price, size, exchange_ts)
+            engine.handle_price_change(asset_id, side, price, size, exchange_ts)
+            features = engine.get_features(asset_id)
             if features:
                 pipeline.handle_poly_book(asset_id, features, recv_ns, metadata.get(asset_id))
+
+    elif event_type == "best_bid_ask":
+        asset_id = msg.get("asset_id", "")
+        if asset_id not in subscribed:
+            return
+        best_bid = msg.get("best_bid")
+        best_ask = msg.get("best_ask")
+        if best_bid is None or best_ask is None:
+            return
+        exchange_ts = int(msg.get("timestamp", "0"))
+        # Apply delta updates to preserve depth from initial REST snapshot.
+        # handle_price_change patches the cached summary's top-of-book fields
+        # while keeping depth features intact.
+        bid_size = msg.get("bid_size", msg.get("size", "1"))
+        ask_size = msg.get("ask_size", msg.get("size", "1"))
+        engine.handle_price_change(asset_id, "BUY", str(best_bid), str(bid_size), exchange_ts)
+        engine.handle_price_change(asset_id, "SELL", str(best_ask), str(ask_size), exchange_ts)
+        features = engine.get_features(asset_id)
+        if features:
+            pipeline.handle_poly_book(asset_id, features, recv_ns, metadata.get(asset_id))
 
     elif event_type == "last_trade_price":
         asset_id = msg.get("asset_id", "")
@@ -271,6 +290,34 @@ def _dispatch_poly(msg: dict, recv_ns: int, subscribed: dict, engine: OrderBookE
         price = float(msg.get("price", "0"))
         size = float(msg.get("size", "0"))
         pipeline.handle_poly_trade(asset_id, side, price, size, recv_ns)
+
+
+async def _fetch_initial_book(session: aiohttp.ClientSession, token_id: str,
+                              engine: OrderBookEngine) -> None:
+    """Fetch full order book snapshot from CLOB REST API and populate the engine."""
+    try:
+        async with session.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": token_id},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status != 200:
+                return
+            data = await resp.json()
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            if not bids and not asks:
+                return
+            exchange_ts = int(data.get("timestamp", "0"))
+            features = engine.handle_book(token_id, bids, asks, exchange_ts)
+            if features:
+                n_bid = len(bids)
+                n_ask = len(asks)
+                mid = features.get("midpoint")
+                logger.info("initial_book_fetched", token=token_id[:12],
+                            bids=n_bid, asks=n_ask, mid=mid)
+    except Exception as e:
+        logger.debug("initial_book_fetch_failed", token=token_id[:12], error=str(e))
 
 
 async def _rotation_loop(ws, config, market_defs, subscribed_assets, asset_metadata,
@@ -330,6 +377,10 @@ async def _rotation_loop(ws, config, market_defs, subscribed_assets, asset_metad
                     logger.info("subscribed", new=len(new_assets), total=len(subscribed_assets))
                 except Exception:
                     pass
+
+                # Fetch initial book snapshots from CLOB REST API to populate full depth
+                for tid in new_assets:
+                    await _fetch_initial_book(session, tid, engine)
 
             await asyncio.sleep(10)
 
